@@ -4,6 +4,8 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -13,47 +15,24 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <time.h>
-#include <ctype.h>
 #define close closesocket
-#define sleep(sec) Sleep((DWORD)((sec) * 1000))
 #define SHUT_RDWR SD_BOTH
 #define strcasecmp _stricmp
 #define strncasecmp _strnicmp
 typedef SOCKET socket_t;
 
-
-static const char *cfnat_sock_error(void)  {
-    static char buf[64];
-    snprintf(buf, sizeof(buf), "WSA error %d", WSAGetLastError());
-    return buf;
-}
-
-
-static int cfnat_socket_valid(socket_t s)  {
+static int cfnat_socket_valid(socket_t s) {
     return s != INVALID_SOCKET;
 }
 
 
-static int cfnat_socket_invalid(socket_t s)  {
+static int cfnat_socket_invalid(socket_t s) {
     return s == INVALID_SOCKET;
 }
 
-
-static char *cfnat_strcasestr(const char *haystack, const char *needle) {
-    if (!haystack || !needle) return NULL;
-    size_t nl=strlen(needle);
-    if (nl==0) return (char*)haystack;
-    for (const char *p=haystack;
-    *p;
-    p++) {
-        size_t i=0;
-        while (i<nl && p[i] && tolower((unsigned char)p[i])==tolower((unsigned char)needle[i])) i++;
-        if (i==nl) return (char*)p;
-    }
-    return NULL;
-}
 #define MAX_IP_LEN 64
 #define MAX_COLO_LEN 8
 #define MAX_REGION_LEN 64
@@ -78,9 +57,26 @@ static const char *LOC_URLS[] =  {
     NULL
 }
 ;
+typedef enum  {
+    SELECT_BEST=0,
+    SELECT_FIRST,
+    SELECT_ROTATE,
+    SELECT_RANDOM
+}
+SelectStrategy;
+typedef enum  {
+    LOG_SILENT=0,
+    LOG_ERROR,
+    LOG_WARN,
+    LOG_INFO,
+    LOG_DEBUG
+}
+LogLevel;
 typedef struct  {
-    char addr[64], colo[128], domain[256];
-    int code, delay_ms, ipnum, ips_type, num, port, http_port, random_mode, task, health_log, verbose, log_conn;
+    char addr[64], colo[128], domain[256], select_name[32], log_name[16];
+    int code, delay_ms, ipnum, ips_type, num, port, http_port, random_mode, task, health_log;
+    SelectStrategy select_strategy;
+    LogLevel log_level;
 }
 Config;
 typedef struct  {
@@ -89,7 +85,7 @@ typedef struct  {
 Location;
 typedef struct  {
     char ip[MAX_IP_LEN], data_center[MAX_COLO_LEN], region[MAX_REGION_LEN], city[MAX_CITY_LEN];
-    int latency_ms;
+    int latency_ms, loss_rate, probe_count, success_count;
 }
 Result;
 typedef struct  {
@@ -141,41 +137,136 @@ static long now_ms(void)  {
 }
 
 
-static void vlog_line(const char *fmt, va_list ap)  {
+static const char* log_level_name(LogLevel level) {
+    switch (level) {
+        case LOG_SILENT:return "silent";
+        case LOG_ERROR:return "error";
+        case LOG_WARN:return "warn";
+        case LOG_INFO:return "info";
+        case LOG_DEBUG:
+        default:return "debug";
+    }
+}
+
+
+static int parse_log_level(const char *v, LogLevel *out) {
+    if (!v||!*v)return -1;
+    if (!strcasecmp(v,"silent")||!strcasecmp(v,"off")) {
+        *out=LOG_SILENT;
+        return 0;
+    }
+    if (!strcasecmp(v,"error")) {
+        *out=LOG_ERROR;
+        return 0;
+    }
+    if (!strcasecmp(v,"warn")||!strcasecmp(v,"warning")) {
+        *out=LOG_WARN;
+        return 0;
+    }
+    if (!strcasecmp(v,"info")) {
+        *out=LOG_INFO;
+        return 0;
+    }
+    if (!strcasecmp(v,"debug")) {
+        *out=LOG_DEBUG;
+        return 0;
+    }
+    return -1;
+}
+
+
+static void vlog_line(const char *tag,const char *fmt, va_list ap)  {
     time_t t=time(NULL);
     struct tm tmv;
     localtime_s(&tmv,&t);
     char ts[32];
     strftime(ts,sizeof(ts),"%Y/%m/%d %H:%M:%S",&tmv);
-    fprintf(stderr,"%s ",ts);
+    fprintf(stderr,"%s [%s] ",ts,tag);
     vfprintf(stderr,fmt,ap);
     fputc('\n',stderr);
 }
 
 
 static void log_msg(const char *fmt, ...)  {
+    if (g_cfg.log_level<LOG_INFO) return;
     va_list ap;
     va_start(ap,fmt);
-    vlog_line(fmt,ap);
+    vlog_line("INFO",fmt,ap);
+    va_end(ap);
+}
+
+
+static void warn_msg(const char *fmt, ...)  {
+    if (g_cfg.log_level<LOG_WARN) return;
+    va_list ap;
+    va_start(ap,fmt);
+    vlog_line("WARN",fmt,ap);
     va_end(ap);
 }
 
 
 static void debug_msg(const char *fmt, ...)  {
-    if (!g_cfg.verbose) return;
+    if (g_cfg.log_level<LOG_DEBUG) return;
     va_list ap;
     va_start(ap,fmt);
-    vlog_line(fmt,ap);
+    vlog_line("DEBUG",fmt,ap);
     va_end(ap);
 }
 
 
 static void conn_msg(const char *fmt, ...)  {
-    if (!g_cfg.verbose && !g_cfg.log_conn) return;
+    if (g_cfg.log_level<LOG_INFO) return;
     va_list ap;
     va_start(ap,fmt);
-    vlog_line(fmt,ap);
+    vlog_line("CONN",fmt,ap);
     va_end(ap);
+}
+
+
+static int sleep_interruptible_ms(int ms) {
+    int left=ms;
+    while (left>0&&atomic_load(&g_running)) {
+        int chunk=left>200?200:left;
+        struct timespec ts;
+        ts.tv_sec=chunk/1000;
+        ts.tv_nsec=(long)(chunk%1000)*1000000L;
+        nanosleep(&ts,NULL);
+        left-=chunk;
+    }
+    return atomic_load(&g_running)?0:-1;
+}
+
+
+static const char* select_name(SelectStrategy strategy) {
+    switch (strategy) {
+        case SELECT_FIRST:return "first";
+        case SELECT_ROTATE:return "rotate";
+        case SELECT_RANDOM:return "random";
+        case SELECT_BEST:
+        default:return "best";
+    }
+}
+
+
+static int parse_select_value(const char *v, SelectStrategy *out) {
+    if (!v||!*v)return -1;
+    if (!strcasecmp(v,"best")) {
+        *out=SELECT_BEST;
+        return 0;
+    }
+    if (!strcasecmp(v,"first")) {
+        *out=SELECT_FIRST;
+        return 0;
+    }
+    if (!strcasecmp(v,"rotate")) {
+        *out=SELECT_ROTATE;
+        return 0;
+    }
+    if (!strcasecmp(v,"random")) {
+        *out=SELECT_RANDOM;
+        return 0;
+    }
+    return -1;
 }
 
 
@@ -186,13 +277,13 @@ static void usage(const char *p)  {
     printf("  -delay=value       有效延迟毫秒 (default 300)\n");
     printf("  -ipnum=value       提取的有效IP数量 (default 20)\n");
     printf("  -ips=value         指定IPv4还是IPv6 (4或6, C版优先IPv4)\n");
+    printf("  -select=value      best=综合评分最优, first=固定首个可用, rotate=轮转候选, random=随机候选 (default best)\n");
+    printf("  -log=value         日志级别: silent,error,warn,info,debug (default info)\n");
     printf("  -num=value         每个连接的目标连接尝试次数 (default 5)\n");
     printf("  -port=value        TLS 转发目标端口 (default 443)\n");
     printf("  -http-port=value   非TLS/HTTP 转发目标端口 (default 80)\n");
     printf("  -random=value      是否随机生成IP (default true)\n");
     printf("  -task=value        扫描线程数 (default 100)\n");
-    printf("  -verbose=value     详细日志 (default false)\n");
-    printf("  -log-conn=value    连接日志 (default false)\n");
 }
 
 
@@ -205,6 +296,8 @@ static void cfg_defaults(Config *c)  {
     memset(c,0,sizeof(*c));
     strcpy(c->addr,"0.0.0.0:1234");
     strcpy(c->domain,"cloudflaremirrors.com/debian");
+    strcpy(c->select_name,"best");
+    strcpy(c->log_name,"info");
     c->code=200;
     c->delay_ms=300;
     c->ipnum=20;
@@ -215,6 +308,8 @@ static void cfg_defaults(Config *c)  {
     c->random_mode=1;
     c->task=100;
     c->health_log=60;
+    c->select_strategy=SELECT_BEST;
+    c->log_level=LOG_INFO;
 }
 
 
@@ -245,14 +340,26 @@ static void parse_args(Config *c, int argc, char **argv)  {
         else if (!strcmp(key,"domain")&&val) snprintf(c->domain,sizeof(c->domain),"%s",val);
         else if (!strcmp(key,"ipnum")&&val) c->ipnum=atoi(val);
         else if (!strcmp(key,"ips")&&val) c->ips_type=atoi(val);
+        else if (!strcmp(key,"select")&&val) {
+            if (parse_select_value(val,&c->select_strategy)!=0) {
+                fprintf(stderr,"非法 -select=%s，可选值: best, first, rotate, random\n",val);
+                exit(1);
+            }
+            snprintf(c->select_name,sizeof(c->select_name),"%s",select_name(c->select_strategy));
+        }
+        else if (!strcmp(key,"log")&&val) {
+            if (parse_log_level(val,&c->log_level)!=0) {
+                fprintf(stderr,"非法 -log=%s，可选值: silent, error, warn, info, debug\n",val);
+                exit(1);
+            }
+            snprintf(c->log_name,sizeof(c->log_name),"%s",log_level_name(c->log_level));
+        }
         else if (!strcmp(key,"num")&&val) c->num=atoi(val);
         else if (!strcmp(key,"port")&&val) c->port=atoi(val);
         else if (!strcmp(key,"http-port")&&val) c->http_port=atoi(val);
         else if (!strcmp(key,"random")) c->random_mode=parse_bool(val);
         else if (!strcmp(key,"task")&&val) c->task=atoi(val);
         else if (!strcmp(key,"health-log")&&val) c->health_log=atoi(val);
-        else if (!strcmp(key,"verbose")) c->verbose=parse_bool(val);
-        else if (!strcmp(key,"log-conn")) c->log_conn=parse_bool(val);
     }
     if (c->delay_ms<=0)c->delay_ms=300;
     if (c->ipnum<=0)c->ipnum=20;
@@ -268,27 +375,21 @@ static int file_exists(const char *path) {
 }
 
 
-static int download_file_from_urls(const char **urls, const char *filename) {
+static int download_file_from_urls(const char **urls,const char *filename) {
     char tmp[256];
-
-    snprintf(tmp, sizeof(tmp), "%s.tmp", filename);
-    for (int i = 0; urls[i]; i++) {
-        char cmd[2048];
-
-        snprintf(
-            cmd,
-            sizeof(cmd),
-            "powershell -NoProfile -ExecutionPolicy Bypass -Command \"$ProgressPreference='SilentlyContinue'; try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; (New-Object Net.WebClient).DownloadFile('%s','%s'); exit 0 } catch { exit 1 }\"",
-            urls[i],
-            tmp
-        );
-        int rc = system(cmd);
-        if (rc == 0 && file_exists(tmp)) {
-            rename(tmp, filename);
+    snprintf(tmp,sizeof(tmp),"%s.tmp",filename);
+    for (int i=0;
+    urls[i];
+    i++) {
+        char cmd[1024];
+        snprintf(cmd,sizeof(cmd),"curl -fsSL '%s' -o '%s' 2>/dev/null || wget -qO '%s' '%s' 2>/dev/null",urls[i],tmp,tmp,urls[i]);
+        int rc=system(cmd);
+        if (rc==0&&file_exists(tmp)) {
+            rename(tmp,filename);
             return 0;
         }
-        remove(tmp);
-        log_msg("从 %s 下载失败，尝试下一个源", urls[i]);
+        unlink(tmp);
+        log_msg("从 %s 下载失败，尝试下一个源",urls[i]);
     }
     return -1;
 }
@@ -494,14 +595,14 @@ static int colo_allowed(const char*colo) {
 
 static int set_nonblock(socket_t fd,int nb) {
     u_long mode=nb?1UL:0UL;
-    return ioctlsocket(fd,FIONBIO,&mode);
+    return ioctlsocket(fd,FIONBIO,&mode)==0?0:-1;
 }
 
 
-static socket_t tcp_connect(const char*ip,int port,int timeout_ms,int*latency_ms) {
+static int tcp_connect(const char*ip,int port,int timeout_ms,int*latency_ms) {
     long start=now_ms();
     socket_t fd=socket(strchr(ip,':')?AF_INET6:AF_INET,SOCK_STREAM,0);
-    if (cfnat_socket_invalid(fd))return INVALID_SOCKET;
+    if (cfnat_socket_invalid(fd))return-1;
     set_nonblock(fd,1);
     int rc;
     if (strchr(ip,':')) {
@@ -511,7 +612,7 @@ static socket_t tcp_connect(const char*ip,int port,int timeout_ms,int*latency_ms
         sa6.sin6_port=htons((uint16_t)port);
         if (inet_pton(AF_INET6,ip,&sa6.sin6_addr)!=1) {
             close(fd);
-            return INVALID_SOCKET;
+            return-1;
         }
         rc=connect(fd,(struct sockaddr*)&sa6,sizeof(sa6));
     }
@@ -522,7 +623,7 @@ static socket_t tcp_connect(const char*ip,int port,int timeout_ms,int*latency_ms
         sa.sin_port=htons((uint16_t)port);
         if (inet_pton(AF_INET,ip,&sa.sin_addr)!=1) {
             close(fd);
-            return INVALID_SOCKET;
+            return-1;
         }
         rc=connect(fd,(struct sockaddr*)&sa,sizeof(sa));
     }
@@ -530,7 +631,7 @@ static socket_t tcp_connect(const char*ip,int port,int timeout_ms,int*latency_ms
         int e=WSAGetLastError();
         if (e!=WSAEWOULDBLOCK&&e!=WSAEINPROGRESS) {
             close(fd);
-            return INVALID_SOCKET;
+            return-1;
         }
     }
     fd_set wfds;
@@ -543,13 +644,13 @@ static socket_t tcp_connect(const char*ip,int port,int timeout_ms,int*latency_ms
     rc=select(fd+1,NULL,&wfds,NULL,&tv);
     if (rc<=0) {
         close(fd);
-        return INVALID_SOCKET;
+        return-1;
     }
     int err=0;
-    socklen_t len=sizeof(err);
+    int len=(int)sizeof(err);
     if (getsockopt(fd,SOL_SOCKET,SO_ERROR,(char*)&err,&len)<0||err!=0) {
         close(fd);
-        return INVALID_SOCKET;
+        return-1;
     }
     set_nonblock(fd,0);
     if (latency_ms)*latency_ms=(int)(now_ms()-start);
@@ -557,7 +658,7 @@ static socket_t tcp_connect(const char*ip,int port,int timeout_ms,int*latency_ms
 }
 
 
-static int recv_headers(socket_t fd,char*buf,size_t bufsz,int timeout_ms) {
+static int recv_headers(int fd,char*buf,size_t bufsz,int timeout_ms) {
     size_t used=0;
     long deadline=now_ms()+timeout_ms;
     while (used+1<bufsz&&now_ms()<deadline) {
@@ -580,6 +681,19 @@ static int recv_headers(socket_t fd,char*buf,size_t bufsz,int timeout_ms) {
     }
     buf[used]=0;
     return (int)used;
+}
+
+
+static char *cfnat_strcasestr(const char *haystack, const char *needle) {
+    if (!haystack || !needle) return NULL;
+    size_t nl=strlen(needle);
+    if (nl==0) return (char*)haystack;
+    for (const char *p=haystack; *p; p++) {
+        size_t i=0;
+        while (i<nl && p[i] && tolower((unsigned char)p[i])==tolower((unsigned char)needle[i])) i++;
+        if (i==nl) return (char*)p;
+    }
+    return NULL;
 }
 
 
@@ -622,46 +736,88 @@ static void resultlist_add(ResultList*rl,const Result*r) {
 
 static void* scan_worker(void*arg) {
     ScanCtx*ctx=(ScanCtx*)arg;
+    const char*req="GET / HTTP/1.1\r\nHost: cloudflaremirrors.com\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n";
     while (1) {
         size_t idx=atomic_fetch_add(&ctx->index,1);
         if (idx>=ctx->total)break;
         const char*ip=ctx->ips[idx];
-        int latency=0;
-        socket_t fd=tcp_connect(ip,80,ctx->cfg->delay_ms,&latency);
-        if (cfnat_socket_invalid(fd))continue;
-        const char*req="GET / HTTP/1.1\r\nHost: cloudflaremirrors.com\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n";
-        send(fd,req,strlen(req),0);
-        char hdr[4096];
-        int n=recv_headers(fd,hdr,sizeof(hdr),2000);
-        close(fd);
-        if (n<=0)continue;
-        char colo[MAX_COLO_LEN]= {
-            0
+        int probes=ctx->cfg->num>0?ctx->cfg->num:1;
+        int success_count=0;
+        int best_latency=0;
+        char best_colo[MAX_COLO_LEN]= {0};
+        for (int attempt=0; attempt<probes; attempt++) {
+            int latency=0;
+            int fd=tcp_connect(ip,80,ctx->cfg->delay_ms,&latency);
+            if (fd<0)continue;
+            send(fd,req,strlen(req),0);
+            char hdr[4096];
+            int n=recv_headers(fd,hdr,sizeof(hdr),2000);
+            close(fd);
+            if (n<=0)continue;
+            char colo[MAX_COLO_LEN]= {0};
+            if (extract_cfray(hdr,colo,sizeof(colo))!=0)continue;
+            if (!colo_allowed(colo))continue;
+            success_count++;
+            if (best_latency==0||latency<best_latency) {
+                best_latency=latency;
+                snprintf(best_colo,sizeof(best_colo),"%s",colo);
+            }
         }
-        ;
-        if (extract_cfray(hdr,colo,sizeof(colo))!=0)continue;
-        if (!colo_allowed(colo))continue;
+        if (success_count<=0||!best_colo[0]||best_latency<=0)continue;
         Result r;
         memset(&r,0,sizeof(r));
         snprintf(r.ip,sizeof(r.ip),"%s",ip);
-        snprintf(r.data_center,sizeof(r.data_center),"%s",colo);
-        r.latency_ms=latency;
-        Location*loc=find_location(colo);
+        snprintf(r.data_center,sizeof(r.data_center),"%s",best_colo);
+        r.latency_ms=best_latency;
+        r.probe_count=probes;
+        r.success_count=success_count;
+        r.loss_rate=(probes-success_count)*100/probes;
+        Location*loc=find_location(best_colo);
         if (loc) {
             snprintf(r.region,sizeof(r.region),"%s",loc->region);
             snprintf(r.city,sizeof(r.city),"%s",loc->city);
         }
-        debug_msg("发现有效IP %s 位置信息 %s 延迟 %d 毫秒",r.ip,r.city[0]?r.city:"未知",latency);
+        debug_msg("发现有效IP %s 位置信息 %s 延迟 %d 毫秒 丢包 %d%% (%d/%d)",r.ip,r.city[0]?r.city:"未知",r.latency_ms,r.loss_rate,r.success_count,r.probe_count);
         resultlist_add(ctx->results,&r);
     }
     return NULL;
 }
 
 
+static int score_result(const Result*r) {
+    return r->latency_ms*10+r->loss_rate*25;
+}
+
+
 static int cmp_result(const void*a,const void*b) {
     const Result*ra=(const Result*)a;
     const Result*rb=(const Result*)b;
-    return ra->latency_ms-rb->latency_ms;
+    int sa=score_result(ra);
+    int sb=score_result(rb);
+    if (sa!=sb)return sa-sb;
+    if (ra->latency_ms!=rb->latency_ms)return ra->latency_ms-rb->latency_ms;
+    return ra->loss_rate-rb->loss_rate;
+}
+
+
+static const char* select_summary(SelectStrategy strategy) {
+    switch (strategy) {
+        case SELECT_FIRST:return "first=启动时固定首个可用 IP，失败后才切换";
+        case SELECT_ROTATE:return "rotate=按候选顺序轮转使用可用 IP";
+        case SELECT_RANDOM:return "random=每次连接从可用候选中随机选择 IP";
+        case SELECT_BEST:
+        default:return "best=按延迟和丢包率综合评分选择当前最优 IP";
+    }
+}
+
+
+static void explain_selected_result(const Result*best) {
+    if (!best)return;
+    if (g_cfg.log_level<LOG_INFO) return;
+    printf("选择策略: %s\n",select_summary(g_cfg.select_strategy));
+    if (g_cfg.log_level>=LOG_DEBUG) {
+        printf("结果解释: 选择 %s，因为延迟 %d ms，丢包 %d%%，综合分 %d。\n",best->ip,best->latency_ms,best->loss_rate,score_result(best));
+    }
 }
 
 
@@ -673,20 +829,32 @@ static ResultList scan_ips(StringList*ips,Config*cfg) {
     pthread_mutex_init(&rl.mu,NULL);
     int threads=cfg->task;
     if ((size_t)threads>ips->len)threads=(int)ips->len;
-    if (threads<=0)return rl;
+    if (threads<=0) {
+        pthread_mutex_destroy(&rl.mu);
+        return rl;
+    }
     pthread_t*tids=calloc((size_t)threads,sizeof(pthread_t));
+    if (!tids) {
+        pthread_mutex_destroy(&rl.mu);
+        return rl;
+    }
     ScanCtx ctx= {
         .ips=ips->items,.total=ips->len,.results=&rl,.cfg=cfg
     }
     ;
     atomic_init(&ctx.index,0);
+    int created=0;
     for (int i=0;
     i<threads;
-    i++)pthread_create(&tids[i],NULL,scan_worker,&ctx);
+    i++) {
+        if (pthread_create(&tids[i],NULL,scan_worker,&ctx)!=0) break;
+        created++;
+    }
     for (int i=0;
-    i<threads;
+    i<created;
     i++)pthread_join(tids[i],NULL);
     free(tids);
+    pthread_mutex_destroy(&rl.mu);
     qsort(rl.items,rl.len,sizeof(Result),cmp_result);
     if (rl.len>(size_t)cfg->ipnum)rl.len=(size_t)cfg->ipnum;
     return rl;
@@ -695,8 +863,8 @@ static ResultList scan_ips(StringList*ips,Config*cfg) {
 
 static int health_check_ip(const char*ip) {
     int latency=0;
-    socket_t fd=tcp_connect(ip,g_cfg.port,2000,&latency);
-    if (cfnat_socket_invalid(fd)) {
+    int fd=tcp_connect(ip,g_cfg.port,2000,&latency);
+    if (fd<0) {
         debug_msg("健康检查失败: IP %s 暂不可用",ip);
         return 0;
     }
@@ -706,15 +874,22 @@ static int health_check_ip(const char*ip) {
 }
 
 
+static int set_current_candidate(size_t idx) {
+    if (idx>=g_candidate_count)return 0;
+    pthread_mutex_lock(&g_ip_mu);
+    snprintf(g_current_ip,sizeof(g_current_ip),"%s",g_candidates[idx].ip);
+    g_current_index=idx;
+    pthread_mutex_unlock(&g_ip_mu);
+    return 1;
+}
+
+
 static int select_valid_ip(void) {
     for (size_t i=0;
     i<g_candidate_count;
     i++) {
         if (health_check_ip(g_candidates[i].ip)) {
-            pthread_mutex_lock(&g_ip_mu);
-            snprintf(g_current_ip,sizeof(g_current_ip),"%s",g_candidates[i].ip);
-            g_current_index=i;
-            pthread_mutex_unlock(&g_ip_mu);
+            set_current_candidate(i);
             log_msg("可用 IP: %s (健康检查端口:%d)",g_candidates[i].ip,g_cfg.port);
             return 1;
         }
@@ -731,11 +906,54 @@ static int switch_next_ip(void) {
     i<g_candidate_count;
     i++) {
         if (health_check_ip(g_candidates[i].ip)) {
-            pthread_mutex_lock(&g_ip_mu);
-            snprintf(g_current_ip,sizeof(g_current_ip),"%s",g_candidates[i].ip);
-            g_current_index=i;
-            pthread_mutex_unlock(&g_ip_mu);
+            set_current_candidate(i);
             log_msg("切换到新的有效 IP: %s 更新 IP 索引: %zu",g_candidates[i].ip,i);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+
+static int choose_ip_for_connection(char*out,size_t sz) {
+    if (!out||sz==0)return 0;
+    out[0]='\0';
+    if (g_candidate_count==0)return 0;
+    if (g_cfg.select_strategy==SELECT_FIRST) {
+        pthread_mutex_lock(&g_ip_mu);
+        snprintf(out,sz,"%s",g_current_ip);
+        pthread_mutex_unlock(&g_ip_mu);
+        return out[0]!=0;
+    }
+    if (g_cfg.select_strategy==SELECT_RANDOM) {
+        size_t start=(size_t)(rand()%((int)g_candidate_count));
+        for (size_t step=0; step<g_candidate_count; step++) {
+            size_t idx=(start+step)%g_candidate_count;
+            if (health_check_ip(g_candidates[idx].ip)) {
+                snprintf(out,sz,"%s",g_candidates[idx].ip);
+                return 1;
+            }
+        }
+        return 0;
+    }
+    if (g_cfg.select_strategy==SELECT_ROTATE) {
+        pthread_mutex_lock(&g_ip_mu);
+        size_t start=g_current_index;
+        pthread_mutex_unlock(&g_ip_mu);
+        for (size_t step=1; step<=g_candidate_count; step++) {
+            size_t idx=(start+step)%g_candidate_count;
+            if (health_check_ip(g_candidates[idx].ip)) {
+                set_current_candidate(idx);
+                snprintf(out,sz,"%s",g_candidates[idx].ip);
+                return 1;
+            }
+        }
+        return 0;
+    }
+    for (size_t i=0; i<g_candidate_count; i++) {
+        if (health_check_ip(g_candidates[i].ip)) {
+            snprintf(out,sz,"%s",g_candidates[i].ip);
+            set_current_candidate(i);
             return 1;
         }
     }
@@ -760,15 +978,15 @@ static int rescan_and_select_ip(void) {
         if (!atomic_load(&g_running))return 0;
         StringList ips=load_ip_list(ipfile,g_cfg.random_mode);
         if (ips.len==0) {
-            log_msg("没有可扫描的 IP，3 秒后重试");
-            sleep(3);
+            warn_msg("没有可扫描的 IP，3 秒后重试");
+            if (sleep_interruptible_ms(3000)!=0) return 0;
             continue;
         }
         ResultList results=scan_ips(&ips,&g_cfg);
         strlist_free(&ips);
         if (results.len==0) {
-            log_msg("重新扫描后仍未发现有效IP，3 秒后重试");
-            sleep(3);
+            warn_msg("重新扫描后仍未发现有效IP，3 秒后重试");
+            if (sleep_interruptible_ms(3000)!=0) return 0;
             continue;
         }
         g_candidates=results.items;
@@ -778,8 +996,8 @@ static int rescan_and_select_ip(void) {
         free(results.items);
         g_candidates=NULL;
         g_candidate_count=0;
-        log_msg("重新扫描得到的候选 IP 健康检查均失败，3 秒后重试");
-        sleep(3);
+        warn_msg("重新扫描得到的候选 IP 健康检查均失败，3 秒后重试");
+        if (sleep_interruptible_ms(3000)!=0) return 0;
     }
 }
 
@@ -796,7 +1014,7 @@ static void* health_thread(void*arg) {
     int fail=0;
     long last=0;
     while (atomic_load(&g_running)) {
-        sleep(10);
+        if (sleep_interruptible_ms(10000)!=0) break;
         char ip[MAX_IP_LEN];
         get_current_ip(ip,sizeof(ip));
         if (!ip[0]||!health_check_ip(ip)) {
@@ -863,66 +1081,73 @@ static int create_small_thread(pthread_t*tid,void*(*fn)(void*),void*arg) {
 }
 
 
-static int relay_bidirectional(socket_t c, socket_t u) {
-    pthread_t t1, t2;
-    PipeCtx a = {c, u};
-    PipeCtx b = {u, c};
-
-    create_small_thread(&t1, pipe_worker, &a);
-    create_small_thread(&t2, pipe_worker, &b);
-    pthread_join(t1, NULL);
-    pthread_join(t2, NULL);
+static int relay_bidirectional(socket_t c,socket_t u) {
+    pthread_t t1,t2;
+    PipeCtx a= {
+        c,u
+    }
+    ,b= {
+        u,c
+    }
+    ;
+    create_small_thread(&t1,pipe_worker,&a);
+    create_small_thread(&t2,pipe_worker,&b);
+    pthread_join(t1,NULL);
+    pthread_join(t2,NULL);
     return 0;
 }
 
 
-static void* connection_thread(void *arg) {
-    ConnCtx *cc = (ConnCtx *)arg;
-    socket_t client = cc->client_fd;
-    unsigned char first = 0;
-    ssize_t n = recv(client, (char *)&first, 1, 0);
-
-    if (n <= 0) {
-        goto out;
-    }
-
-    int is_tls = first == 0x16;
-    int target_port = is_tls ? cc->tls_port : cc->http_port;
-    conn_msg("识别客户端协议: %s，转发到 IP: %s 端口: %d", is_tls ? "TLS" : "非 TLS", cc->ip, target_port);
-
-    socket_t upstream = INVALID_SOCKET;
-    int best = 0;
-    for (int i = 0; i < cc->num; i++) {
-        int lat = 0;
-        socket_t fd = tcp_connect(cc->ip, target_port, cc->delay_ms, &lat);
-
+static void* connection_thread(void*arg) {
+    ConnCtx*cc=(ConnCtx*)arg;
+    socket_t client=cc->client_fd;
+    unsigned char first=0;
+    ssize_t n=recv(client,(char*)&first,1,0);
+    if (n<=0)goto out;
+    int is_tls=first==0x16;
+    int target_port=is_tls?cc->tls_port:cc->http_port;
+    conn_msg("识别客户端协议: %s，转发到 IP: %s 端口: %d",is_tls?"TLS":"非 TLS",cc->ip,target_port);
+    socket_t upstream=INVALID_SOCKET;
+    int best=0;
+    for (int i=0;
+    i<cc->num;
+    i++) {
+        int lat=0;
+        socket_t fd=tcp_connect(cc->ip,target_port,cc->delay_ms,&lat);
         if (cfnat_socket_valid(fd)) {
-            upstream = fd;
-            best = lat;
+            upstream=fd;
+            best=lat;
             break;
         }
     }
-
     if (cfnat_socket_invalid(upstream)) {
         debug_msg("未找到符合延迟要求的连接，关闭客户端连接");
         goto out;
     }
-
-    send(upstream, (const char *)&first, 1, 0);
-    conn_msg("选择连接: 地址: %s:%d 延迟: %d ms", cc->ip, target_port, best);
-    relay_bidirectional(client, upstream);
+    send(upstream,(const char*)&first,1,0);
+    conn_msg("选择连接: 地址: %s:%d 延迟: %d ms",cc->ip,target_port,best);
+    relay_bidirectional(client,upstream);
     close(upstream);
-
-out:
-    close(client);
-    int active = atomic_fetch_sub(&g_active_connections, 1) - 1;
-    conn_msg("客户端连接关闭，当前活跃连接数: %d", active);
+    out:close(client);
+    int active=atomic_fetch_sub(&g_active_connections,1)-1;
+    conn_msg("客户端连接关闭，当前活跃连接数: %d",active);
     free(cc);
     return NULL;
 }
 
 
 static int parse_addr(const char*addr,char*host,size_t hostsz,int*port) {
+    if (!addr||!host||!port)return-1;
+    if (addr[0]=='[') {
+        const char*end=strchr(addr,']');
+        if (!end||end[1]!=':')return-1;
+        size_t n=(size_t)(end-(addr+1));
+        if (n>=hostsz)n=hostsz-1;
+        memcpy(host,addr+1,n);
+        host[n]=0;
+        *port=atoi(end+2);
+        return *port>0?0:-1;
+    }
     const char*colon=strrchr(addr,':');
     if (!colon)return-1;
     size_t n=(size_t)(colon-addr);
@@ -935,37 +1160,51 @@ static int parse_addr(const char*addr,char*host,size_t hostsz,int*port) {
 }
 
 
-static socket_t listen_tcp(const char *addr) {
+static socket_t listen_tcp(const char*addr) {
     char host[128];
-    int port = 0;
-
-    if (parse_addr(addr, host, sizeof(host), &port) != 0) {
-        return INVALID_SOCKET;
+    int port=0;
+    if (parse_addr(addr,host,sizeof(host),&port)!=0)return-1;
+    BOOL yes=TRUE;
+    if (strchr(host,':')) {
+        socket_t fd=socket(AF_INET6,SOCK_STREAM,0);
+        if (cfnat_socket_invalid(fd))return INVALID_SOCKET;
+        setsockopt(fd,SOL_SOCKET,SO_REUSEADDR,(const char*)&yes,sizeof(yes));
+        struct sockaddr_in6 sa6;
+        memset(&sa6,0,sizeof(sa6));
+        sa6.sin6_family=AF_INET6;
+        sa6.sin6_port=htons((uint16_t)port);
+        if (inet_pton(AF_INET6,host,&sa6.sin6_addr)!=1) {
+            close(fd);
+            return-1;
+        }
+        if (bind(fd,(struct sockaddr*)&sa6,sizeof(sa6))!=0) {
+            close(fd);
+            return-1;
+        }
+        if (listen(fd,1024)!=0) {
+            close(fd);
+            return-1;
+        }
+        return fd;
     }
-
-    socket_t fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (cfnat_socket_invalid(fd)) {
-        return INVALID_SOCKET;
-    }
-
-    BOOL yes = TRUE;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&yes, sizeof(yes));
-
+    socket_t fd=socket(AF_INET,SOCK_STREAM,0);
+    if (cfnat_socket_invalid(fd))return INVALID_SOCKET;
+    setsockopt(fd,SOL_SOCKET,SO_REUSEADDR,(const char*)&yes,sizeof(yes));
     struct sockaddr_in sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons((uint16_t)port);
-    if (inet_pton(AF_INET, host, &sa.sin_addr) != 1) {
+    memset(&sa,0,sizeof(sa));
+    sa.sin_family=AF_INET;
+    sa.sin_port=htons((uint16_t)port);
+    if (inet_pton(AF_INET,host,&sa.sin_addr)!=1) {
         close(fd);
-        return INVALID_SOCKET;
+        return-1;
     }
-    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+    if (bind(fd,(struct sockaddr*)&sa,sizeof(sa))!=0) {
         close(fd);
-        return INVALID_SOCKET;
+        return-1;
     }
-    if (listen(fd, 1024) != 0) {
+    if (listen(fd,1024)!=0) {
         close(fd);
-        return INVALID_SOCKET;
+        return-1;
     }
     return fd;
 }
@@ -1023,20 +1262,37 @@ int main(int argc,char**argv) {
         start=now_ms();
         results=scan_ips(&ips,&g_cfg);
         if (results.len>0)break;
-        log_msg("未发现有效IP，可尝试放宽 -delay 或开启 -verbose=true 查看细节，3 秒后重试");
+        warn_msg("未发现有效IP，可尝试放宽 -delay 或提高 -log=debug 查看细节，3 秒后重试");
         if (!atomic_load(&g_running)) {
             strlist_free(&ips);
             free(g_locations);
             WSACleanup();
             return 0;
         }
-        sleep(3);
+        if (sleep_interruptible_ms(3000)!=0) {
+            strlist_free(&ips);
+            free(g_locations);
+            WSACleanup();
+            return 0;
+        }
     }
-    printf("IP 地址 | 数据中心 | 地区 | 城市 | 延迟\n");
+    printf("候选池统计\n");
+    printf("当前策略: %s\n",g_cfg.select_name);
+    printf("候选总数: %zu\n",results.len);
+    if (g_cfg.log_level>=LOG_INFO) {
+        printf("策略说明: %s\n",select_summary(g_cfg.select_strategy));
+    }
+    printf("IP 地址 | 数据中心 | 地区 | 城市 | 延迟 | 丢包 | 探测成功\n");
     for (size_t i=0;
     i<results.len;
-    i++)printf("%s | %s | %s | %s | %d ms\n",results.items[i].ip,results.items[i].data_center,results.items[i].region,results.items[i].city,results.items[i].latency_ms);
+    i++)printf("%s | %s | %s | %s | %d ms | %d%% | %d/%d\n",results.items[i].ip,results.items[i].data_center,results.items[i].region,results.items[i].city,results.items[i].latency_ms,results.items[i].loss_rate,results.items[i].success_count,results.items[i].probe_count);
     printf("成功提取 %zu 个有效IP，耗时 %ld秒\n",results.len,(now_ms()-start)/1000);
+    if (results.len>0) {
+        printf("评分最优 IP: %s\n",results.items[0].ip);
+        printf("最佳延迟: %d ms\n",results.items[0].latency_ms);
+        printf("最佳丢包率: %d%%\n",results.items[0].loss_rate);
+        explain_selected_result(&results.items[0]);
+    }
     g_candidates=results.items;
     g_candidate_count=results.len;
     if (!select_valid_ip()) {
@@ -1045,31 +1301,30 @@ int main(int argc,char**argv) {
         free(results.items);
         return 1;
     }
+    strlist_free(&ips);
     socket_t lfd=listen_tcp(g_cfg.addr);
     if (cfnat_socket_invalid(lfd)) {
-        log_msg("无法监听 %s: %s",g_cfg.addr,cfnat_sock_error());
-        strlist_free(&ips);
+        log_msg("无法监听 %s: WSA error %d",g_cfg.addr,WSAGetLastError());
         free(results.items);
         return 1;
     }
     g_listen_fd=lfd;
-    log_msg("正在监听 %s，TLS目标端口：%d，非TLS目标端口：%d，连接尝试次数：%d，有效延迟：%d ms",g_cfg.addr,g_cfg.port,g_cfg.http_port,g_cfg.num,g_cfg.delay_ms);
+    log_msg("正在监听 %s，TLS目标端口：%d，非TLS目标端口：%d，连接尝试次数：%d，有效延迟：%d ms，策略：%s，日志：%s",g_cfg.addr,g_cfg.port,g_cfg.http_port,g_cfg.num,g_cfg.delay_ms,g_cfg.select_name,g_cfg.log_name);
     pthread_t ht;
     create_small_thread(&ht,health_thread,NULL);
     while (atomic_load(&g_running)) {
         struct sockaddr_storage ss;
-        socklen_t slen=sizeof(ss);
+        int slen=(int)sizeof(ss);
         socket_t cfd=accept(lfd,(struct sockaddr*)&ss,&slen);
         if (cfnat_socket_invalid(cfd)) {
             int e=WSAGetLastError();
             if (!atomic_load(&g_running))break;
             if (e==WSAEINTR||e==WSAENOTSOCK)break;
-            sleep(1);
+            if (sleep_interruptible_ms(1000)!=0) break;
             continue;
         }
         char ip[MAX_IP_LEN];
-        get_current_ip(ip,sizeof(ip));
-        if (!ip[0]) {
+        if (!choose_ip_for_connection(ip,sizeof(ip))) {
             close(cfd);
             continue;
         }
@@ -1094,9 +1349,12 @@ int main(int argc,char**argv) {
     if (cfnat_socket_valid(lfd))close(lfd);
     g_listen_fd=INVALID_SOCKET;
     pthread_join(ht,NULL);
-    strlist_free(&ips);
     free(results.items);
+    g_candidates=NULL;
+    g_candidate_count=0;
     free(g_locations);
+    g_locations=NULL;
+    g_location_count=0;
     WSACleanup();
     return 0;
 }
