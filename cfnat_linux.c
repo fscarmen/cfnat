@@ -1332,6 +1332,116 @@ static int cmp_result(const void *a, const void *b) {
     return ra->loss_rate - rb->loss_rate;
 }
 
+
+static int health_check_ip(const char *ip, BaiduProxyPool *proxy_pool);
+static int set_current_candidate(size_t idx);
+
+#define CACHE_REFRESH_INTERVAL_SECONDS 3600L
+#define CACHE_QUICK_CHECK_COUNT 5
+
+static const char *candidate_cache_file(void) {
+    if (g_cfg.ips_type == 6) return g_cfg.use_baidu_proxy ? "cfnat-cache-v6-baidu.txt" : "cfnat-cache-v6.txt";
+    return g_cfg.use_baidu_proxy ? "cfnat-cache-v4-baidu.txt" : "cfnat-cache-v4.txt";
+}
+
+static void save_candidate_cache(const char *path, const Result *items, size_t len) {
+    if (!path || !items || len == 0) return;
+    FILE *fp = fopen(path, "wb");
+    if (!fp) {
+        warn_msg("写入缓存 %s 失败", path);
+        return;
+    }
+    fprintf(fp, "# cfnat-cache-v1 %ld\n", (long)time(NULL));
+    size_t limit = len;
+    if (g_cfg.ipnum > 0 && limit > (size_t)g_cfg.ipnum) limit = (size_t)g_cfg.ipnum;
+    for (size_t i = 0; i < limit; i++) {
+        const Result *r = &items[i];
+        fprintf(fp, "%s|%s|%s|%s|%d|%d|%d|%d\n",
+                r->ip,
+                r->data_center[0] ? r->data_center : "UNK",
+                r->region[0] ? r->region : "Unknown",
+                r->city[0] ? r->city : "Unknown",
+                r->latency_ms,
+                r->loss_rate,
+                r->success_count,
+                r->probe_count);
+    }
+    fclose(fp);
+    debug_msg("候选缓存已写入 %s，共 %zu 个", path, limit);
+}
+
+static ResultList load_candidate_cache(const char *path) {
+    ResultList rl = {0};
+    pthread_mutex_init(&rl.mu, NULL);
+    if (!path || !file_exists(path)) return rl;
+
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return rl;
+
+    char line[MAX_LINE];
+    if (fgets(line, sizeof(line), fp)) {
+        if (strncmp(line, "# cfnat-cache-v1", 16) != 0) {
+            rewind(fp);
+        }
+    }
+
+    while (fgets(line, sizeof(line), fp)) {
+        if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
+        Result r;
+        memset(&r, 0, sizeof(r));
+        int parsed = sscanf(line, "%63[^|]|%7[^|]|%63[^|]|%63[^|]|%d|%d|%d|%d",
+                            r.ip,
+                            r.data_center,
+                            r.region,
+                            r.city,
+                            &r.latency_ms,
+                            &r.loss_rate,
+                            &r.success_count,
+                            &r.probe_count);
+        if (parsed < 8 || !r.ip[0]) continue;
+        if (r.latency_ms <= 0) r.latency_ms = g_cfg.delay_ms > 0 ? g_cfg.delay_ms : 1;
+        if (r.probe_count <= 0) r.probe_count = g_cfg.num > 0 ? g_cfg.num : 1;
+        if (r.success_count <= 0) r.success_count = 1;
+        if (g_cfg.colo[0] && strcmp(r.data_center, "UNK") != 0 && !colo_allowed(r.data_center)) continue;
+        resultlist_add(&rl, &r);
+        if (g_cfg.ipnum > 0 && rl.len >= (size_t)g_cfg.ipnum) break;
+    }
+    fclose(fp);
+    qsort(rl.items, rl.len, sizeof(Result), cmp_result);
+    if (rl.len > 0) log_msg("已读取候选缓存 %s，共 %zu 个，开始快速健康检查", path, rl.len);
+    return rl;
+}
+
+static int try_use_candidate_cache(BaiduProxyPool *proxy_pool, ResultList *out) {
+    if (!out) return 0;
+    memset(out, 0, sizeof(*out));
+    const char *path = candidate_cache_file();
+    ResultList cached = load_candidate_cache(path);
+    if (cached.len == 0) {
+        pthread_mutex_destroy(&cached.mu);
+        return 0;
+    }
+
+    g_candidates = cached.items;
+    g_candidate_count = cached.len;
+    size_t check_count = cached.len < CACHE_QUICK_CHECK_COUNT ? cached.len : CACHE_QUICK_CHECK_COUNT;
+    for (size_t i = 0; i < check_count; i++) {
+        if (health_check_ip(cached.items[i].ip, proxy_pool)) {
+            set_current_candidate(i);
+            log_msg("命中候选缓存，快速启动使用 IP: %s，后台将继续刷新候选池", cached.items[i].ip);
+            *out = cached;
+            return 1;
+        }
+    }
+
+    warn_msg("候选缓存健康检查未命中，将执行完整扫描");
+    g_candidates = NULL;
+    g_candidate_count = 0;
+    free(cached.items);
+    pthread_mutex_destroy(&cached.mu);
+    return 0;
+}
+
 static void explain_selected_result(const Result *best) {
     if (!best) return;
     if (g_cfg.log_level < LOG_DEBUG) return;
@@ -1480,6 +1590,7 @@ static int rescan_and_select_ip(BaiduProxyPool *proxy_pool) {
         }
         g_candidates = results.items;
         g_candidate_count = results.len;
+        save_candidate_cache(candidate_cache_file(), results.items, results.len);
         log_msg("重新扫描得到 %zu 个候选 IP", g_candidate_count);
         if (select_valid_ip(proxy_pool)) return 1;
         free(results.items);
@@ -1561,6 +1672,63 @@ static int create_small_thread(pthread_t *tid, void *(*fn)(void *), void *arg) {
     int rc = pthread_create(tid, &attr, fn, arg);
     pthread_attr_destroy(&attr);
     return rc;
+}
+
+
+typedef struct {
+    BaiduProxyPool *proxy_pool;
+} RefreshCtx;
+
+static void replace_candidates_from_refresh(ResultList *results, BaiduProxyPool *proxy_pool) {
+    if (!results || results->len == 0) return;
+    save_candidate_cache(candidate_cache_file(), results->items, results->len);
+    if (!health_check_ip(results->items[0].ip, proxy_pool)) {
+        warn_msg("后台刷新得到候选，但首选 IP 健康检查失败，暂不替换当前候选池");
+        free(results->items);
+        results->items = NULL;
+        results->len = 0;
+        return;
+    }
+
+    Result *old_items = g_candidates;
+    (void)old_items;
+    g_candidates = results->items;
+    g_candidate_count = results->len;
+    set_current_candidate(0);
+    log_msg("后台刷新完成，当前最优 IP 已更新为 %s", results->items[0].ip);
+    results->items = NULL;
+    results->len = 0;
+}
+
+static void *refresh_thread(void *arg) {
+    RefreshCtx *ctx = (RefreshCtx *)arg;
+    int first = 1;
+    while (atomic_load(&g_running)) {
+        if (!first) {
+            if (sleep_interruptible_ms(CACHE_REFRESH_INTERVAL_SECONDS * 1000) != 0) break;
+        }
+        first = 0;
+        if (!atomic_load(&g_running)) break;
+
+        const char *ipfile = g_cfg.ips_type == 6 ? "ips-v6.txt" : "ips-v4.txt";
+        log_msg("后台开始刷新候选 IP，服务保持监听中");
+        StringList ips = load_ip_list(ipfile, g_cfg.random_mode);
+        if (ips.len == 0) {
+            warn_msg("后台刷新未读取到可扫描 IP");
+            continue;
+        }
+        ResultList results = scan_ips(&ips, &g_cfg, ctx ? ctx->proxy_pool : NULL);
+        strlist_free(&ips);
+        if (results.len == 0) {
+            warn_msg("后台刷新未发现有效候选 IP，继续使用当前候选池");
+            free(results.items);
+            pthread_mutex_destroy(&results.mu);
+            continue;
+        }
+        replace_candidates_from_refresh(&results, ctx ? ctx->proxy_pool : NULL);
+        pthread_mutex_destroy(&results.mu);
+    }
+    return NULL;
 }
 
 static int relay_bidirectional(int c, int u) {
@@ -2055,10 +2223,15 @@ int main(int argc, char **argv) {
     }
     long start = 0;
     ResultList results = {0};
+    int used_cache = try_use_candidate_cache(g_cfg.use_baidu_proxy ? &g_default_proxy_pool : NULL, &results);
     for (;;) {
+        if (used_cache) break;
         start = now_ms();
         results = scan_ips(&ips, &g_cfg, g_cfg.use_baidu_proxy ? &g_default_proxy_pool : NULL);
-        if (results.len > 0) break;
+        if (results.len > 0) {
+            save_candidate_cache(candidate_cache_file(), results.items, results.len);
+            break;
+        }
         warn_msg("未发现有效IP，可尝试放宽 -delay 或提高 -log=debug 查看细节，3 秒后重试");
         if (!atomic_load(&g_running)) {
             strlist_free(&ips);
@@ -2114,7 +2287,10 @@ int main(int argc, char **argv) {
     g_listen_fd = lfd;
     log_msg("正在监听 %s，TLS目标端口：%d，非TLS目标端口：%d，连接尝试次数：%d，有效延迟：%d ms，日志：%s", g_cfg.addr, g_cfg.port, g_cfg.http_port, g_cfg.num, g_cfg.delay_ms, g_cfg.log_name);
     pthread_t ht;
+    pthread_t rt;
+    RefreshCtx refresh_ctx = { .proxy_pool = g_cfg.use_baidu_proxy ? &g_default_proxy_pool : NULL };
     create_small_thread(&ht, health_thread, g_cfg.use_baidu_proxy ? &g_default_proxy_pool : NULL);
+    create_small_thread(&rt, refresh_thread, &refresh_ctx);
     while (atomic_load(&g_running)) {
         struct sockaddr_storage ss;
         socklen_t slen = sizeof(ss);
@@ -2152,6 +2328,7 @@ int main(int argc, char **argv) {
     if (lfd >= 0) close(lfd);
     g_listen_fd = -1;
     pthread_join(ht, NULL);
+    pthread_join(rt, NULL);
     free(results.items);
     g_candidates = NULL;
     g_candidate_count = 0;
