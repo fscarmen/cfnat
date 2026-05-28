@@ -1,25 +1,59 @@
+#ifdef _WIN32
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0601
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#include <windns.h>
+#include <wininet.h>
+#include <io.h>
+#include <locale.h>
+#else
 #define _GNU_SOURCE
 #include <arpa/inet.h>
-#include <errno.h>
-#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
+#endif
+
+#include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdatomic.h>
-#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include <sys/select.h>
-#include <sys/socket.h>
 #include <sys/stat.h>
-#include <sys/time.h>
 #include <time.h>
-#include <unistd.h>
+
+#ifdef _WIN32
+#define close closesocket
+#define SHUT_RDWR SD_BOTH
+#define strcasecmp _stricmp
+#define strncasecmp _strnicmp
+typedef SOCKET socket_t;
+static int cfnat_socket_valid(socket_t s) { return s != INVALID_SOCKET; }
+static int cfnat_socket_invalid(socket_t s) { return s == INVALID_SOCKET; }
+#else
+typedef int socket_t;
+#ifndef INVALID_SOCKET
+#define INVALID_SOCKET (-1)
+#endif
+#ifndef SOCKET_ERROR
+#define SOCKET_ERROR (-1)
+#endif
+static int cfnat_socket_valid(socket_t s) { return s >= 0; }
+static int cfnat_socket_invalid(socket_t s) { return s < 0; }
+#endif
 
 #define MAX_IP_LEN 64
 #define MAX_COLO_LEN 8
@@ -145,17 +179,18 @@ typedef struct {
 } CandidatePool;
 
 typedef struct {
-    int client_fd, tls_port, http_port, num, delay_ms;
+    socket_t client_fd;
+    int tls_port, http_port, num, delay_ms;
     char ip[MAX_IP_LEN];
     BaiduProxyPool *proxy_pool;
 } ConnCtx;
 
 typedef struct {
-    int from, to;
+    socket_t from, to;
 } PipeCtx;
 
 typedef struct {
-    int listen_fd;
+    socket_t listen_fd;
     CarrierListenSpec spec;
     CandidatePool candidates;
     BaiduProxyPool *proxy_pool;
@@ -174,7 +209,7 @@ static char g_current_ip[MAX_IP_LEN] = {0};
 static pthread_mutex_t g_ip_mu = PTHREAD_MUTEX_INITIALIZER;
 static atomic_int g_running = 1;
 static atomic_int g_active_connections = 0;
-static int g_listen_fd = -1;
+static socket_t g_listen_fd = INVALID_SOCKET;
 
 static BaiduProxyPool g_default_proxy_pool = {0};
 
@@ -184,12 +219,130 @@ static pthread_mutex_t g_log_mu = PTHREAD_MUTEX_INITIALIZER;
 
 
 static int parse_addr(const char *addr, char *host, size_t hostsz, int *port);
-static int accept_interruptible(int listen_fd, struct sockaddr *addr, socklen_t *addrlen);
+static socket_t accept_interruptible(socket_t listen_fd, struct sockaddr *addr,
+#ifdef _WIN32
+        int *addrlen
+#else
+        socklen_t *addrlen
+#endif
+);
+
+#ifdef _WIN32
+static int cfnat_get_console_handle(FILE *stream, HANDLE *out) {
+    int fd = _fileno(stream);
+    if (fd < 0) return 0;
+
+    intptr_t os_handle = _get_osfhandle(fd);
+    if (os_handle == -1) return 0;
+
+    HANDLE handle = (HANDLE)os_handle;
+    DWORD mode = 0;
+    if (!GetConsoleMode(handle, &mode)) return 0;
+
+    if (out) *out = handle;
+    return 1;
+}
+
+static int cfnat_write_utf8(FILE *stream, const char *text, size_t len) {
+    if (!text || len == 0) return 0;
+
+    HANDLE handle = NULL;
+    if (!cfnat_get_console_handle(stream, &handle)) {
+        return (int)fwrite(text, 1, len, stream);
+    }
+
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, text, (int)len, NULL, 0);
+    if (wlen <= 0) {
+        return (int)fwrite(text, 1, len, stream);
+    }
+
+    wchar_t *wide = (wchar_t *)malloc(((size_t)wlen + 1) * sizeof(wchar_t));
+    if (!wide) {
+        return (int)fwrite(text, 1, len, stream);
+    }
+
+    MultiByteToWideChar(CP_UTF8, 0, text, (int)len, wide, wlen);
+    wide[wlen] = L'\0';
+
+    DWORD written = 0;
+    BOOL ok = WriteConsoleW(handle, wide, (DWORD)wlen, &written, NULL);
+    free(wide);
+
+    if (!ok) {
+        return (int)fwrite(text, 1, len, stream);
+    }
+    return (int)len;
+}
+
+static int cfnat_vfprintf(FILE *stream, const char *fmt, va_list ap) {
+    char stack_buf[8192];
+    va_list ap_copy;
+    va_copy(ap_copy, ap);
+    int needed = vsnprintf(stack_buf, sizeof(stack_buf), fmt, ap_copy);
+    va_end(ap_copy);
+
+    if (needed < 0) return needed;
+    if ((size_t)needed < sizeof(stack_buf)) {
+        cfnat_write_utf8(stream, stack_buf, (size_t)needed);
+        return needed;
+    }
+
+    char *buf = (char *)malloc((size_t)needed + 1);
+    if (!buf) {
+        cfnat_write_utf8(stream, stack_buf, strlen(stack_buf));
+        return needed;
+    }
+
+    va_copy(ap_copy, ap);
+    vsnprintf(buf, (size_t)needed + 1, fmt, ap_copy);
+    va_end(ap_copy);
+
+    cfnat_write_utf8(stream, buf, (size_t)needed);
+    free(buf);
+    return needed;
+}
+
+static int cfnat_fprintf(FILE *stream, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int rc = cfnat_vfprintf(stream, fmt, ap);
+    va_end(ap);
+    return rc;
+}
+
+static int cfnat_printf(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int rc = cfnat_vfprintf(stdout, fmt, ap);
+    va_end(ap);
+    return rc;
+}
+
+static int cfnat_fputc(int ch, FILE *stream) {
+    char c = (char)ch;
+    cfnat_write_utf8(stream, &c, 1);
+    return ch;
+}
+
+static void init_windows_console_utf8(void) {
+    setlocale(LC_ALL, "");
+}
+
+#define printf cfnat_printf
+#define fprintf cfnat_fprintf
+#define vfprintf cfnat_vfprintf
+#define fputc cfnat_fputc
+
+#endif
 
 static long now_ms(void) {
+#ifdef _WIN32
+    return (long)GetTickCount64();
+#else
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return (long)tv.tv_sec * 1000L + tv.tv_usec / 1000L;
+#endif
 }
 
 static const char *log_level_name(LogLevel level) {
@@ -236,7 +389,11 @@ static int parse_log_level(const char *v, LogLevel *out) {
 static void vlog_line(const char *tag, const char *fmt, va_list ap) {
     time_t t = time(NULL);
     struct tm tmv;
+#ifdef _WIN32
+    localtime_s(&tmv, &t);
+#else
     localtime_r(&t, &tmv);
+#endif
     char ts[32];
     strftime(ts, sizeof(ts), "%Y/%m/%d %H:%M:%S", &tmv);
     pthread_mutex_lock(&g_log_mu);
@@ -283,10 +440,14 @@ static int sleep_interruptible_ms(int ms) {
     int left = ms;
     while (left > 0 && atomic_load(&g_running)) {
         int chunk = left > 200 ? 200 : left;
+#ifdef _WIN32
+        Sleep((DWORD)chunk);
+#else
         struct timespec ts;
         ts.tv_sec = chunk / 1000;
         ts.tv_nsec = (long)(chunk % 1000) * 1000000L;
         nanosleep(&ts, NULL);
+#endif
         left -= chunk;
     }
     return atomic_load(&g_running) ? 0 : -1;
@@ -390,7 +551,92 @@ static int file_exists(const char *path) {
     return stat(path, &st) == 0 && S_ISREG(st.st_mode);
 }
 
+#ifdef _WIN32
+static wchar_t *utf8_to_wide_alloc(const char *s) {
+    if (!s) return NULL;
+    int len = MultiByteToWideChar(CP_UTF8, 0, s, -1, NULL, 0);
+    if (len <= 0) return NULL;
+    wchar_t *w = (wchar_t *)calloc((size_t)len, sizeof(wchar_t));
+    if (!w) return NULL;
+    if (MultiByteToWideChar(CP_UTF8, 0, s, -1, w, len) <= 0) {
+        free(w);
+        return NULL;
+    }
+    return w;
+}
+
+static int download_file_wininet(const char *url, const char *filename) {
+    wchar_t *wurl = utf8_to_wide_alloc(url);
+    if (!wurl) return -1;
+
+    HINTERNET hnet = InternetOpenW(L"cfnat/1.0", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
+    if (!hnet) {
+        free(wurl);
+        return -1;
+    }
+
+    DWORD flags = INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_PRAGMA_NOCACHE;
+    if (strncmp(url, "https://", 8) == 0) {
+        flags |= INTERNET_FLAG_SECURE | INTERNET_FLAG_IGNORE_CERT_CN_INVALID | INTERNET_FLAG_IGNORE_CERT_DATE_INVALID;
+    }
+
+    HINTERNET hurl = InternetOpenUrlW(hnet, wurl, NULL, 0, flags, 0);
+    free(wurl);
+    if (!hurl) {
+        InternetCloseHandle(hnet);
+        return -1;
+    }
+
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", filename);
+    FILE *out = fopen(tmp, "wb");
+    if (!out) {
+        InternetCloseHandle(hurl);
+        InternetCloseHandle(hnet);
+        return -1;
+    }
+
+    char buf[16384];
+    DWORD got = 0;
+    int rc = 0;
+    for (;;) {
+        if (!InternetReadFile(hurl, buf, sizeof(buf), &got)) {
+            rc = -1;
+            break;
+        }
+        if (got == 0) break;
+        if (fwrite(buf, 1, got, out) != got) {
+            rc = -1;
+            break;
+        }
+    }
+
+    fclose(out);
+    InternetCloseHandle(hurl);
+    InternetCloseHandle(hnet);
+
+    if (rc != 0 || !file_exists(tmp)) {
+        remove(tmp);
+        return -1;
+    }
+
+    remove(filename);
+    if (rename(tmp, filename) != 0) {
+        remove(tmp);
+        return -1;
+    }
+    return 0;
+}
+#endif
+
 static int download_file_from_urls(const char **urls, const char *filename) {
+#ifdef _WIN32
+    for (int i = 0; urls[i]; i++) {
+        if (download_file_wininet(urls[i], filename) == 0) return 0;
+        log_msg("从 %s 下载失败，尝试下一个源", urls[i]);
+    }
+    return -1;
+#else
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "%s.tmp", filename);
     for (int i = 0; urls[i]; i++) {
@@ -405,6 +651,14 @@ static int download_file_from_urls(const char **urls, const char *filename) {
         log_msg("从 %s 下载失败，尝试下一个源", urls[i]);
     }
     return -1;
+#endif
+}
+
+static int ensure_data_file(const char *expected, const char **urls) {
+    if (file_exists(expected)) return 0;
+
+    printf("文件 %s 不存在，正在下载数据\n", expected);
+    return download_file_from_urls(urls, expected);
 }
 
 static char *read_file_all(const char *path, size_t *out_len) {
@@ -538,12 +792,9 @@ static char *json_string_value(char *p, const char *key, char *out, size_t outsz
 }
 
 static void load_locations(void) {
-    if (!file_exists("locations.json")) {
-        printf("本地 locations.json 不存在，正在下载 locations.json\n");
-        if (download_file_from_urls(LOC_URLS, "locations.json") != 0) {
-            log_msg("下载 locations.json 失败");
-            return;
-        }
+    if (ensure_data_file("locations.json", LOC_URLS) != 0) {
+        log_msg("下载 locations.json 失败");
+        return;
     }
     size_t len = 0;
     char *json = read_file_all("locations.json", &len);
@@ -592,18 +843,23 @@ static int colo_allowed(const char *colo) {
     return 0;
 }
 
-static int set_nonblock(int fd, int nb) {
+static int set_nonblock(socket_t fd, int nb) {
+#ifdef _WIN32
+    u_long mode = nb ? 1UL : 0UL;
+    return ioctlsocket(fd, FIONBIO, &mode) == 0 ? 0 : -1;
+#else
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags < 0) return -1;
     if (nb) flags |= O_NONBLOCK;
     else flags &= ~O_NONBLOCK;
     return fcntl(fd, F_SETFL, flags);
+#endif
 }
 
-static int tcp_connect(const char *ip, int port, int timeout_ms, int *latency_ms) {
+static socket_t tcp_connect(const char *ip, int port, int timeout_ms, int *latency_ms) {
     long start = now_ms();
-    int fd = socket(strchr(ip, ':') ? AF_INET6 : AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
+    socket_t fd = socket(strchr(ip, ':') ? AF_INET6 : AF_INET, SOCK_STREAM, 0);
+    if (cfnat_socket_invalid(fd)) return INVALID_SOCKET;
     set_nonblock(fd, 1);
     int rc;
     if (strchr(ip, ':')) {
@@ -613,7 +869,7 @@ static int tcp_connect(const char *ip, int port, int timeout_ms, int *latency_ms
         sa6.sin6_port = htons((uint16_t)port);
         if (inet_pton(AF_INET6, ip, &sa6.sin6_addr) != 1) {
             close(fd);
-            return -1;
+            return INVALID_SOCKET;
         }
         rc = connect(fd, (struct sockaddr *)&sa6, sizeof(sa6));
     } else {
@@ -623,14 +879,24 @@ static int tcp_connect(const char *ip, int port, int timeout_ms, int *latency_ms
         sa.sin_port = htons((uint16_t)port);
         if (inet_pton(AF_INET, ip, &sa.sin_addr) != 1) {
             close(fd);
-            return -1;
+            return INVALID_SOCKET;
         }
         rc = connect(fd, (struct sockaddr *)&sa, sizeof(sa));
     }
+#ifdef _WIN32
+    if (rc == SOCKET_ERROR) {
+        int werr = WSAGetLastError();
+        if (werr != WSAEWOULDBLOCK && werr != WSAEINPROGRESS && werr != WSAEALREADY) {
+            close(fd);
+            return INVALID_SOCKET;
+        }
+    }
+#else
     if (rc < 0 && errno != EINPROGRESS) {
         close(fd);
-        return -1;
+        return INVALID_SOCKET;
     }
+#endif
     fd_set wfds;
     FD_ZERO(&wfds);
     FD_SET(fd, &wfds);
@@ -638,23 +904,32 @@ static int tcp_connect(const char *ip, int port, int timeout_ms, int *latency_ms
         timeout_ms / 1000,
         (timeout_ms % 1000) * 1000
     };
+#ifdef _WIN32
+    rc = select(0, NULL, &wfds, NULL, &tv);
+#else
     rc = select(fd + 1, NULL, &wfds, NULL, &tv);
+#endif
     if (rc <= 0) {
         close(fd);
-        return -1;
+        return INVALID_SOCKET;
     }
     int err = 0;
+#ifdef _WIN32
+    int len = (int)sizeof(err);
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, (char *)&err, &len) < 0 || err != 0) {
+#else
     socklen_t len = sizeof(err);
     if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0) {
+#endif
         close(fd);
-        return -1;
+        return INVALID_SOCKET;
     }
     set_nonblock(fd, 0);
     if (latency_ms) * latency_ms = (int)(now_ms() - start);
     return fd;
 }
 
-static int recv_headers(int fd, char *buf, size_t bufsz, int timeout_ms) {
+static int recv_headers(socket_t fd, char *buf, size_t bufsz, int timeout_ms) {
     size_t used = 0;
     long deadline = now_ms() + timeout_ms;
     while (used + 1 < bufsz && now_ms() < deadline) {
@@ -679,8 +954,20 @@ static int recv_headers(int fd, char *buf, size_t bufsz, int timeout_ms) {
     return (int)used;
 }
 
+static char *cfnat_strcasestr(const char *haystack, const char *needle) {
+    if (!haystack || !needle) return NULL;
+    size_t nl = strlen(needle);
+    if (nl == 0) return (char *)haystack;
+    for (const char *p = haystack; *p; p++) {
+        size_t i = 0;
+        while (i < nl && p[i] && tolower((unsigned char)p[i]) == tolower((unsigned char)needle[i])) i++;
+        if (i == nl) return (char *)p;
+    }
+    return NULL;
+}
+
 static int extract_cfray(const char *headers, char *colo, size_t sz) {
-    const char *p = strcasestr(headers, "CF-RAY:");
+    const char *p = cfnat_strcasestr(headers, "CF-RAY:");
     if (!p) return -1;
     const char *line_end = strstr(p, "\r\n");
     if (!line_end) line_end = p + strlen(p);
@@ -735,6 +1022,26 @@ static void append_unique_addr(StringList *list, const char *value) {
     strlist_add(list, value);
 }
 
+#ifdef _WIN32
+static int lookup_txt_first(const char *name, char *out, size_t outsz) {
+    PDNS_RECORD rec = NULL;
+    DNS_STATUS st = DnsQuery_A(name, DNS_TYPE_TEXT, DNS_QUERY_STANDARD, NULL, &rec, NULL);
+    if (st != 0 || !rec) return -1;
+    int rc = -1;
+    for (PDNS_RECORD cur = rec; cur; cur = cur->pNext) {
+        if (cur->wType != DNS_TYPE_TEXT) continue;
+        if (cur->Data.TXT.dwStringCount == 0) continue;
+        const char *txt = cur->Data.TXT.pStringArray[0];
+        if (!txt || !*txt) continue;
+        snprintf(out, outsz, "%s", txt);
+        rc = 0;
+        break;
+    }
+    DnsRecordListFree(rec, DnsFreeRecordList);
+    return rc;
+}
+
+#else
 static int read_first_nameserver(char *out, size_t outsz) {
     FILE *f = fopen("/etc/resolv.conf", "r");
     if (!f) {
@@ -751,7 +1058,12 @@ static int read_first_nameserver(char *out, size_t outsz) {
         char *e = p;
         while (*e && *e != ' ' && *e != '	') e++;
         *e = '\0';
-        snprintf(out, outsz, "%s", p);
+        if (outsz > 0) {
+            size_t copy_len = strlen(p);
+            if (copy_len >= outsz) copy_len = outsz - 1;
+            memcpy(out, p, copy_len);
+            out[copy_len] = '\0';
+        }
         fclose(f);
         return 0;
     }
@@ -819,7 +1131,7 @@ static int lookup_txt_first(const char *name, char *out, size_t outsz) {
     char ns[64];
     read_first_nameserver(ns, sizeof(ns));
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) return -1;
+    if (cfnat_socket_invalid(fd)) return -1;
 
     struct sockaddr_in sa;
     memset(&sa, 0, sizeof(sa));
@@ -890,6 +1202,8 @@ static int lookup_txt_first(const char *name, char *out, size_t outsz) {
     return -1;
 }
 
+
+#endif
 
 static int lookup_asn_for_ip(const char *ip, char *out, size_t outsz) {
     unsigned int a = 0, b = 0, c = 0, d = 0;
@@ -1007,13 +1321,13 @@ static BaiduProxyNode *baidu_pool_pick(BaiduProxyPool *pool) {
     return best;
 }
 
-static int tcp_connect_via_baidu(const char *node_addr, const char *target_addr, int timeout_ms, int *latency_ms) {
+static socket_t tcp_connect_via_baidu(const char *node_addr, const char *target_addr, int timeout_ms, int *latency_ms) {
     long start = now_ms();
     char host[MAX_ADDR_LEN] = {0};
     int port = 0;
-    if (parse_addr(node_addr, host, sizeof(host), &port) != 0) return -1;
-    int fd = tcp_connect(host, port, timeout_ms, NULL);
-    if (fd < 0) return -1;
+    if (parse_addr(node_addr, host, sizeof(host), &port) != 0) return INVALID_SOCKET;
+    socket_t fd = tcp_connect(host, port, timeout_ms, NULL);
+    if (cfnat_socket_invalid(fd)) return INVALID_SOCKET;
     char req[1024];
     snprintf(req, sizeof(req),
             "CONNECT %s HTTP/1.1\r\n"
@@ -1024,27 +1338,27 @@ static int tcp_connect_via_baidu(const char *node_addr, const char *target_addr,
             "Connection: keep-alive\r\n\r\n", target_addr);
     if (send(fd, req, strlen(req), 0) < 0) {
         close(fd);
-        return -1;
+        return INVALID_SOCKET;
     }
     char hdr[4096];
     int n = recv_headers(fd, hdr, sizeof(hdr), timeout_ms);
     if (n <= 0 || strstr(hdr, " 200 ") == NULL) {
         close(fd);
-        return -1;
+        return INVALID_SOCKET;
     }
     if (latency_ms) * latency_ms = (int)(now_ms() - start);
     return fd;
 }
 
-static int dial_target_with_proxy(const char *ip, int port, int timeout_ms, BaiduProxyPool *pool, int *latency_ms) {
+static socket_t dial_target_with_proxy(const char *ip, int port, int timeout_ms, BaiduProxyPool *pool, int *latency_ms) {
     if (!pool || pool->len == 0) return tcp_connect(ip, port, timeout_ms, latency_ms);
     char target[MAX_ADDR_LEN];
     snprintf(target, sizeof(target), "%s:%d", ip, port);
     BaiduProxyNode *node = baidu_pool_pick(pool);
-    if (!node) return -1;
+    if (!node) return INVALID_SOCKET;
     atomic_fetch_add(&node->active, 1);
-    int fd = tcp_connect_via_baidu(node->addr, target, timeout_ms, latency_ms);
-    if (fd >= 0) {
+    socket_t fd = tcp_connect_via_baidu(node->addr, target, timeout_ms, latency_ms);
+    if (cfnat_socket_valid(fd)) {
         if (latency_ms && *latency_ms > 0) atomic_store(&node->ewma_ms, (atomic_load(&node->ewma_ms) * 7 + *latency_ms) / 8);
         if (atomic_load(&node->failures) > 0) atomic_fetch_sub(&node->failures, 1);
     } else {
@@ -1194,8 +1508,8 @@ static int build_baidu_pool_for_carrier(BaiduProxyPool *pool, const char *carrie
         char addr[MAX_ADDR_LEN];
         snprintf(addr, sizeof(addr), "%s:%d", ips.items[i], g_cfg.baidu_port);
         int latency = 0;
-        int fd = tcp_connect_via_baidu(addr, g_cfg.baidu_scan_target, g_cfg.delay_ms > 0 ? g_cfg.delay_ms : 1000, &latency);
-        if (fd >= 0) {
+        socket_t fd = tcp_connect_via_baidu(addr, g_cfg.baidu_scan_target, g_cfg.delay_ms > 0 ? g_cfg.delay_ms : 1000, &latency);
+        if (cfnat_socket_valid(fd)) {
             close(fd);
             baidu_pool_add(pool, addr);
             if ((int)pool->len >= g_cfg.baidu_ipnum) break;
@@ -1236,8 +1550,8 @@ static void *scan_worker(void *arg) {
 
         for (int attempt = 0; atomic_load(&g_running) && attempt < probes; attempt++) {
             int latency = 0;
-            int fd = dial_target_with_proxy(ip, 80, ctx->cfg->delay_ms, ctx->proxy_pool, &latency);
-            if (fd < 0) {
+            socket_t fd = dial_target_with_proxy(ip, 80, ctx->cfg->delay_ms, ctx->proxy_pool, &latency);
+            if (cfnat_socket_invalid(fd)) {
                 atomic_fetch_add(&ctx->connect_fail, 1);
                 continue;
             }
@@ -1503,8 +1817,8 @@ static ResultList scan_ips(StringList *ips, Config *cfg, BaiduProxyPool *proxy_p
 
 static int health_check_ip(const char *ip, BaiduProxyPool *proxy_pool) {
     int latency = 0;
-    int fd = dial_target_with_proxy(ip, g_cfg.port, 2000, proxy_pool, &latency);
-    if (fd < 0) {
+    socket_t fd = dial_target_with_proxy(ip, g_cfg.port, 2000, proxy_pool, &latency);
+    if (cfnat_socket_invalid(fd)) {
         debug_msg("健康检查失败: IP %s 暂不可用", ip);
         return 0;
     }
@@ -1641,7 +1955,7 @@ static void *health_thread(void *arg) {
     return NULL;
 }
 
-static void close_pair(int a, int b) {
+static void close_pair(socket_t a, socket_t b) {
     shutdown(a, SHUT_RDWR);
     shutdown(b, SHUT_RDWR);
 }
@@ -1731,7 +2045,7 @@ static void *refresh_thread(void *arg) {
     return NULL;
 }
 
-static int relay_bidirectional(int c, int u) {
+static int relay_bidirectional(socket_t c, socket_t u) {
     pthread_t t1, t2;
     PipeCtx a = {
         c,
@@ -1750,28 +2064,29 @@ static int relay_bidirectional(int c, int u) {
 
 static void *connection_thread(void *arg) {
     ConnCtx *cc = (ConnCtx *)arg;
-    int client = cc->client_fd;
+    socket_t client = cc->client_fd;
     unsigned char first = 0;
-    ssize_t n = recv(client, &first, 1, 0);
+    ssize_t n = recv(client, (char *) & first, 1, 0);
     if (n <= 0) goto out;
     int is_tls = first == 0x16;
     int target_port = is_tls ? cc->tls_port : cc->http_port;
     conn_msg("识别客户端协议: %s，转发到 IP: %s 端口: %d", is_tls ? "TLS" : "非 TLS", cc->ip, target_port);
-    int upstream = -1, best = 0;
+    socket_t upstream = INVALID_SOCKET;
+    int best = 0;
     for (int i = 0; i < cc->num; i++) {
         int lat = 0;
-        int fd = dial_target_with_proxy(cc->ip, target_port, cc->delay_ms, cc->proxy_pool, &lat);
-        if (fd >= 0) {
+        socket_t fd = dial_target_with_proxy(cc->ip, target_port, cc->delay_ms, cc->proxy_pool, &lat);
+        if (cfnat_socket_valid(fd)) {
             upstream = fd;
             best = lat;
             break;
         }
     }
-    if (upstream < 0) {
+    if (cfnat_socket_invalid(upstream)) {
         debug_msg("未找到符合延迟要求的连接，关闭客户端连接");
         goto out;
     }
-    send(upstream, &first, 1, 0);
+    send(upstream, (const char *) & first, 1, 0);
     conn_msg("选择连接: 地址: %s:%d 延迟: %d ms", cc->ip, target_port, best);
     relay_bidirectional(client, upstream);
     close(upstream);
@@ -1785,8 +2100,8 @@ static void *connection_thread(void *arg) {
 static int carrier_health_check_ip(CarrierRuntime *rt, const char *ip) {
     if (!rt || !ip || !*ip) return 0;
     int latency = 0;
-    int fd = dial_target_with_proxy(ip, g_cfg.port, 2000, rt->proxy_pool, &latency);
-    if (fd < 0) {
+    socket_t fd = dial_target_with_proxy(ip, g_cfg.port, 2000, rt->proxy_pool, &latency);
+    if (cfnat_socket_invalid(fd)) {
         debug_msg("%s 健康检查失败: IP %s 暂不可用", carrier_display_name(rt->spec.carrier), ip);
         return 0;
     }
@@ -1927,11 +2242,22 @@ static void *carrier_accept_thread(void *arg) {
     CarrierRuntime *rt = (CarrierRuntime *)arg;
     while (atomic_load(&g_running)) {
         struct sockaddr_storage ss;
+#ifdef _WIN32
+        int slen = (int)sizeof(ss);
+#else
         socklen_t slen = sizeof(ss);
-        int cfd = accept_interruptible(rt->listen_fd, (struct sockaddr *)&ss, &slen);
-        if (cfd < 0) {
+#endif
+        socket_t cfd = accept_interruptible(rt->listen_fd, (struct sockaddr *)&ss, &slen);
+        if (cfnat_socket_invalid(cfd)) {
             if (!atomic_load(&g_running)) break;
+#ifdef _WIN32
+            {
+                int e = WSAGetLastError();
+                if (e == WSAEINTR || e == WSAENOTSOCK) break;
+            }
+#else
             if (errno == EINTR || errno == EBADF) break;
+#endif
             if (sleep_interruptible_ms(1000) != 0) break;
             continue;
         }
@@ -1985,14 +2311,14 @@ static int parse_addr(const char *addr, char *host, size_t hostsz, int *port) {
     return *port > 0 ? 0 : -1;
 }
 
-static int listen_tcp(const char *addr) {
+static socket_t listen_tcp(const char *addr) {
     char host[128];
     int port = 0;
-    if (parse_addr(addr, host, sizeof(host), &port) != 0) return -1;
+    if (parse_addr(addr, host, sizeof(host), &port) != 0) return INVALID_SOCKET;
     int yes = 1;
     if (strchr(host, ':')) {
-        int fd = socket(AF_INET6, SOCK_STREAM, 0);
-        if (fd < 0) return -1;
+        socket_t fd = socket(AF_INET6, SOCK_STREAM, 0);
+        if (cfnat_socket_invalid(fd)) return INVALID_SOCKET;
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
         struct sockaddr_in6 sa6;
         memset(&sa6, 0, sizeof(sa6));
@@ -2012,8 +2338,8 @@ static int listen_tcp(const char *addr) {
         }
         return fd;
     }
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
+    socket_t fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (cfnat_socket_invalid(fd)) return INVALID_SOCKET;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
     struct sockaddr_in sa;
     memset(&sa, 0, sizeof(sa));
@@ -2034,45 +2360,72 @@ static int listen_tcp(const char *addr) {
     return fd;
 }
 
-static int accept_interruptible(int listen_fd, struct sockaddr *addr, socklen_t *addrlen) {
+static socket_t accept_interruptible(socket_t listen_fd, struct sockaddr *addr,
+#ifdef _WIN32
+        int *addrlen
+#else
+        socklen_t *addrlen
+#endif
+) {
     while (atomic_load(&g_running)) {
         fd_set rfds;
         FD_ZERO(&rfds);
         FD_SET(listen_fd, &rfds);
 
         struct timeval tv = {1, 0};
+#ifdef _WIN32
+        int rc = select(0, &rfds, NULL, NULL, &tv);
+        if (rc == SOCKET_ERROR) {
+            int err = WSAGetLastError();
+            if (err == WSAEINTR) continue;
+            return INVALID_SOCKET;
+        }
+#else
         int rc = select(listen_fd + 1, &rfds, NULL, NULL, &tv);
         if (rc < 0) {
             if (errno == EINTR) continue;
-            return -1;
+            return INVALID_SOCKET;
         }
+#endif
         if (rc == 0) continue;
 
-        int cfd = accept(listen_fd, addr, addrlen);
-        if (cfd < 0 && errno == EINTR) continue;
+        socket_t cfd = accept(listen_fd, addr, addrlen);
+#ifdef _WIN32
+        if (cfnat_socket_invalid(cfd) && WSAGetLastError() == WSAEINTR) continue;
+#else
+        if (cfnat_socket_invalid(cfd) && errno == EINTR) continue;
+#endif
         return cfd;
     }
 
+#ifdef _WIN32
+    WSASetLastError(WSAEINTR);
+#else
     errno = EINTR;
-    return -1;
+#endif
+    return INVALID_SOCKET;
 }
 
 static void on_signal(int sig) {
     (void)sig;
     atomic_store(&g_running, 0);
-    if (g_listen_fd >= 0) {
+    if (cfnat_socket_valid(g_listen_fd)) {
         close(g_listen_fd);
-        g_listen_fd = -1;
+        g_listen_fd = INVALID_SOCKET;
     }
     for (size_t i = 0; i < g_carrier_runtime_count; i++) {
-        if (g_carrier_runtimes[i].listen_fd >= 0) {
+        if (cfnat_socket_valid(g_carrier_runtimes[i].listen_fd)) {
             close(g_carrier_runtimes[i].listen_fd);
-            g_carrier_runtimes[i].listen_fd = -1;
+            g_carrier_runtimes[i].listen_fd = INVALID_SOCKET;
         }
     }
 }
 
 static void install_signals(void) {
+#ifdef _WIN32
+    signal(SIGINT, on_signal);
+    signal(SIGTERM, on_signal);
+#else
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = on_signal;
@@ -2081,19 +2434,26 @@ static void install_signals(void) {
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
+#endif
 }
 
 int main(int argc, char **argv) {
+#ifdef _WIN32
+    init_windows_console_utf8();
+
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        fprintf(stderr, "WSAStartup failed\n");
+        return 1;
+    }
+#endif
     parse_args(&g_cfg, argc, argv);
     install_signals();
     const char *ipfile = g_cfg.ips_type == 6 ? "ips-v6.txt" : "ips-v4.txt";
     const char **urls = g_cfg.ips_type == 6 ? IPS_V6_URLS : IPS_V4_URLS;
-    if (!file_exists(ipfile)) {
-        printf("文件 %s 不存在，正在下载数据\n", ipfile);
-        if (download_file_from_urls(urls, ipfile) != 0) {
-            log_msg("下载 %s 失败", ipfile);
-            return 1;
-        }
+    if (ensure_data_file(ipfile, urls) != 0) {
+        log_msg("下载 %s 失败", ipfile);
+        return 1;
     }
     log_msg("正在加载 locations.json");
     load_locations();
@@ -2137,13 +2497,18 @@ int main(int argc, char **argv) {
             free(carrier_specs);
             baidu_pool_free(&g_default_proxy_pool);
             free(g_locations);
+#ifdef _WIN32
+        #ifdef _WIN32
+    WSACleanup();
+#endif
+#endif
             return 1;
         }
         g_carrier_runtime_count = carrier_spec_len;
         log_msg("运营商分池模式启动，监听器数量: %zu", carrier_spec_len);
         for (size_t i = 0; i < carrier_spec_len; i++) {
             CarrierRuntime *rt = &g_carrier_runtimes[i];
-            rt->listen_fd = -1;
+            rt->listen_fd = INVALID_SOCKET;
             rt->spec = carrier_specs[i];
             pthread_mutex_init(&rt->candidates.mu, NULL);
             if (g_cfg.use_baidu_proxy) {
@@ -2174,7 +2539,7 @@ int main(int argc, char **argv) {
                 continue;
             }
             rt->listen_fd = listen_tcp(rt->spec.addr);
-            if (rt->listen_fd < 0) {
+            if (cfnat_socket_invalid(rt->listen_fd)) {
                 log_msg("无法监听 %s(%s): %s", carrier_display_name(rt->spec.carrier), rt->spec.addr, strerror(errno));
                 free(rt->candidates.items);
                 rt->candidates.items = NULL;
@@ -2193,9 +2558,9 @@ int main(int argc, char **argv) {
         }
         for (size_t i = 0; i < g_carrier_runtime_count; i++) {
             CarrierRuntime *rt = &g_carrier_runtimes[i];
-            if (rt->listen_fd >= 0) {
+            if (cfnat_socket_valid(rt->listen_fd)) {
                 close(rt->listen_fd);
-                rt->listen_fd = -1;
+                rt->listen_fd = INVALID_SOCKET;
             }
         }
         for (size_t i = 0; i < g_carrier_runtime_count; i++) {
@@ -2239,6 +2604,11 @@ int main(int argc, char **argv) {
             free(carrier_specs);
             baidu_pool_free(&g_default_proxy_pool);
             free(g_locations);
+#ifdef _WIN32
+        #ifdef _WIN32
+    WSACleanup();
+#endif
+#endif
             return 0;
         }
         if (sleep_interruptible_ms(3000) != 0) {
@@ -2247,6 +2617,11 @@ int main(int argc, char **argv) {
             free(carrier_specs);
             baidu_pool_free(&g_default_proxy_pool);
             free(g_locations);
+#ifdef _WIN32
+        #ifdef _WIN32
+    WSACleanup();
+#endif
+#endif
             return 0;
         }
     }
@@ -2276,9 +2651,13 @@ int main(int argc, char **argv) {
     strlist_free(&ips);
     free(resolver_specs);
     free(carrier_specs);
-    int lfd = listen_tcp(g_cfg.addr);
-    if (lfd < 0) {
+    socket_t lfd = listen_tcp(g_cfg.addr);
+    if (cfnat_socket_invalid(lfd)) {
+#ifdef _WIN32
+        log_msg("无法监听 %s: WSA error %d", g_cfg.addr, WSAGetLastError());
+#else
         log_msg("无法监听 %s: %s", g_cfg.addr, strerror(errno));
+#endif
         free(results.items);
         baidu_pool_free(&g_default_proxy_pool);
         free(g_locations);
@@ -2293,11 +2672,22 @@ int main(int argc, char **argv) {
     create_small_thread(&rt, refresh_thread, &refresh_ctx);
     while (atomic_load(&g_running)) {
         struct sockaddr_storage ss;
+#ifdef _WIN32
+        int slen = (int)sizeof(ss);
+#else
         socklen_t slen = sizeof(ss);
-        int cfd = accept_interruptible(lfd, (struct sockaddr *)&ss, &slen);
-        if (cfd < 0) {
+#endif
+        socket_t cfd = accept_interruptible(lfd, (struct sockaddr *)&ss, &slen);
+        if (cfnat_socket_invalid(cfd)) {
             if (!atomic_load(&g_running)) break;
+#ifdef _WIN32
+            {
+                int e = WSAGetLastError();
+                if (e == WSAEINTR || e == WSAENOTSOCK) break;
+            }
+#else
             if (errno == EINTR || errno == EBADF) break;
+#endif
             if (sleep_interruptible_ms(1000) != 0) break;
             continue;
         }
@@ -2325,8 +2715,8 @@ int main(int argc, char **argv) {
         create_small_thread(&tid, connection_thread, cc);
         pthread_detach(tid);
     }
-    if (lfd >= 0) close(lfd);
-    g_listen_fd = -1;
+    if (cfnat_socket_valid(lfd)) close(lfd);
+    g_listen_fd = INVALID_SOCKET;
     pthread_join(ht, NULL);
     pthread_join(rt, NULL);
     free(results.items);
@@ -2336,5 +2726,8 @@ int main(int argc, char **argv) {
     free(g_locations);
     g_locations = NULL;
     g_location_count = 0;
+#ifdef _WIN32
+    WSACleanup();
+#endif
     return 0;
 }

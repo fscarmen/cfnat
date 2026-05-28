@@ -88,36 +88,52 @@ jobs:
             packages: gcc-s390x-linux-gnu libc6-dev-s390x-cross
             cc: s390x-linux-gnu-gcc
             cflags: ""
+
     env:
-      SOURCE_FILE: cfnat_linux.c
+      SOURCE_FILE: cfnat.c
+
     steps:
-      - uses: actions/checkout@v6
+      - name: Checkout repository
+        uses: actions/checkout@v6
         with:
           fetch-depth: 1
           token: ${{ github.token }}
+
       - name: Install cross compiler
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ${{ matrix.packages }} file ca-certificates
+          sudo apt-get install -y --no-install-recommends \
+            ${{ matrix.packages }} \
+            file \
+            ca-certificates
+
       - name: Build Linux glibc dynamic
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist
-          if [ ! -f "$SOURCE_FILE" ]; then echo "SOURCE_FILE '$SOURCE_FILE' not found" >&2; exit 1; fi
+
+          if [ ! -f "$SOURCE_FILE" ]; then
+            echo "SOURCE_FILE '$SOURCE_FILE' not found" >&2
+            exit 1
+          fi
+
           ${{ matrix.cc }} -O2 -pipe -std=c11 \
             -Wall -Wextra -Wno-unused-parameter ${{ matrix.cflags }} \
             "$SOURCE_FILE" -o "dist/${{ matrix.artifact }}" \
             -pthread -s
-          chmod +x "dist/${{ matrix.artifact }}"
+
           file "dist/${{ matrix.artifact }}"
-      - uses: actions/upload-artifact@v7
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: dist/${{ matrix.artifact }}
           if-no-files-found: error
+
 
   build-linux-musl:
     name: Build ${{ matrix.name }} musl static
@@ -159,40 +175,80 @@ jobs:
             artifact: cfnat-linux-riscv64-musl
             zig_target: riscv64-linux-musl
             cflags: ""
+
     env:
-      SOURCE_FILE: cfnat_linux.c
+      SOURCE_FILE: cfnat.c
+      ZIG_VERSION: 0.15.1
+
     steps:
-      - uses: actions/checkout@v6
+      - name: Checkout repository
+        uses: actions/checkout@v6
         with:
           fetch-depth: 1
           token: ${{ github.token }}
+
       - name: Setup Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.15.1
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          case "$(uname -m)" in
+            x86_64)
+              zig_arch="x86_64"
+              ;;
+            aarch64|arm64)
+              zig_arch="aarch64"
+              ;;
+            *)
+              echo "Unsupported runner arch: $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+
+          zig_dir="zig-${zig_arch}-linux-${ZIG_VERSION}"
+          zig_url="https://ziglang.org/download/${ZIG_VERSION}/${zig_dir}.tar.xz"
+
+          curl -fsSL "$zig_url" -o zig.tar.xz
+          tar -xf zig.tar.xz
+
+          echo "$PWD/$zig_dir" >> "$GITHUB_PATH"
+
       - name: Install common tools
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends file ca-certificates
+          sudo apt-get install -y --no-install-recommends \
+            file \
+            ca-certificates
+
       - name: Build Linux musl static
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist
-          if [ ! -f "$SOURCE_FILE" ]; then echo "SOURCE_FILE '$SOURCE_FILE' not found" >&2; exit 1; fi
+
+          if [ ! -f "$SOURCE_FILE" ]; then
+            echo "SOURCE_FILE '$SOURCE_FILE' not found" >&2
+            exit 1
+          fi
+
+          zig version
+
           zig cc -target ${{ matrix.zig_target }} -O2 -pipe -std=c11 \
             -Wall -Wextra -Wno-unused-parameter ${{ matrix.cflags }} \
             "$SOURCE_FILE" -o "dist/${{ matrix.artifact }}" \
             -pthread -static -s
-          chmod +x "dist/${{ matrix.artifact }}"
+
           file "dist/${{ matrix.artifact }}"
-      - uses: actions/upload-artifact@v7
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: dist/${{ matrix.artifact }}
           if-no-files-found: error
+
 
   build-windows:
     name: Build ${{ matrix.name }}
@@ -209,37 +265,54 @@ jobs:
             artifact: cfnat-windows-386.exe
             packages: gcc-mingw-w64-i686
             cc: i686-w64-mingw32-gcc
+
     env:
-      SOURCE_FILE: cfnat_windows.c
+      SOURCE_FILE: cfnat.c
+
     steps:
-      - uses: actions/checkout@v6
+      - name: Checkout repository
+        uses: actions/checkout@v6
         with:
           fetch-depth: 1
           token: ${{ github.token }}
+
       - name: Install MinGW-w64
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ${{ matrix.packages }} file ca-certificates
+          sudo apt-get install -y --no-install-recommends \
+            ${{ matrix.packages }} \
+            file \
+            ca-certificates
+
       - name: Build Windows Win7+
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist
-          if [ ! -f "$SOURCE_FILE" ]; then echo "SOURCE_FILE '$SOURCE_FILE' not found" >&2; exit 1; fi
+
+          if [ ! -f "$SOURCE_FILE" ]; then
+            echo "SOURCE_FILE '$SOURCE_FILE' not found" >&2
+            exit 1
+          fi
+
           ${{ matrix.cc }} \
             -O2 -pipe -std=c11 -D_WIN32_WINNT=0x0601 \
             -finput-charset=UTF-8 -fexec-charset=UTF-8 \
             -Wall -Wextra -Wno-unused-parameter \
             "$SOURCE_FILE" -o "dist/${{ matrix.artifact }}" \
             -lws2_32 -ldnsapi -lwininet -lwinpthread -static -s
+
           file "dist/${{ matrix.artifact }}"
-      - uses: actions/upload-artifact@v7
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: dist/${{ matrix.artifact }}
           if-no-files-found: error
+
 
   build-macos:
     name: Build ${{ matrix.name }}
@@ -256,76 +329,91 @@ jobs:
             artifact: cfnat-darwin-arm64
             arch: arm64
             minver: "11.0"
-    env:
-      SOURCE_FILE: cfnat_macos.c
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 1
-          token: ${{ github.token }}
-      - name: Build macOS
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          if [ ! -f "$SOURCE_FILE" ]; then echo "SOURCE_FILE '$SOURCE_FILE' not found" >&2; exit 1; fi
-          clang \
-            -O2 -pipe -std=c11 \
-            -Wall -Wextra -Wno-unused-parameter \
-            -arch ${{ matrix.arch }} -mmacosx-version-min=${{ matrix.minver }} \
-            "$SOURCE_FILE" -o "dist/${{ matrix.artifact }}" \
-            -pthread
-          strip "dist/${{ matrix.artifact }}" || true
-          chmod +x "dist/${{ matrix.artifact }}"
-          file "dist/${{ matrix.artifact }}"
-      - uses: actions/upload-artifact@v7
-        with:
-          name: ${{ matrix.artifact }}
-          path: dist/${{ matrix.artifact }}
-          if-no-files-found: error
 
-  release:
-    name: Publish release
-    needs: [build-linux-glibc, build-linux-musl, build-windows, build-macos]
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
+    env:
+      SOURCE_FILE: cfnat.c
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
         with:
           fetch-depth: 1
           token: ${{ github.token }}
+
+      - name: Build macOS
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          if [ ! -f "$SOURCE_FILE" ]; then
+            echo "SOURCE_FILE '$SOURCE_FILE' not found" >&2
+            exit 1
+          fi
+
+          clang \
+            -O2 -pipe -std=c11 \
+            -Wall -Wextra -Wno-unused-parameter \
+            -arch ${{ matrix.arch }} -mmacosx-version-min=${{ matrix.minver }} \
+            "$SOURCE_FILE" -o "dist/${{ matrix.artifact }}" \
+            -pthread
+
+          strip "dist/${{ matrix.artifact }}" || true
+          file "dist/${{ matrix.artifact }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}
+          if-no-files-found: error
+
+
+  release:
+    name: Publish release
+    needs:
+      - build-linux-glibc
+      - build-linux-musl
+      - build-windows
+      - build-macos
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          token: ${{ github.token }}
+
       - name: Download artifacts
         uses: actions/download-artifact@v8
         with:
           path: dist
-      - name: Assemble release bundle
+
+      - name: Assemble release files
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p package/bin release
+
+          mkdir -p release
+
           find dist -maxdepth 3 -type f -print0 | while IFS= read -r -d '' file; do
             name="$(basename "$file")"
-            cp "$file" "package/bin/$name"
             cp "$file" "release/$name"
-            case "$name" in
-              *.exe) ;;
-              *) chmod +x "package/bin/$name" "release/$name" ;;
-            esac
           done
-          cp cfnat_linux.c cfnat_macos.c cfnat_windows.c README.md package/
-          if [ -f ips-v4.txt ]; then cp ips-v4.txt package/; fi
-          if [ -f ips-v6.txt ]; then cp ips-v6.txt package/; fi
-          if [ -f locations.json ]; then cp locations.json package/; fi
-          (cd package && zip -r ../release/cfnat-release.zip .)
-          ls -lh package
-          ls -lh release
+
+          echo "Release contents:"
+          find release -maxdepth 1 -type f -exec ls -lh {} \;
+
       - name: Create checksums
         shell: bash
         run: |
           set -euo pipefail
+
           cd release
           sha256sum * > sha256sums.txt
+
       - name: Upload GitHub Release
         uses: softprops/action-gh-release@v3
         with:
