@@ -1500,16 +1500,63 @@ static ResultList scan_ips(StringList *ips, Config *cfg, BaiduProxyPool *proxy_p
     return rl;
 }
 
+static int http_probe(socket_t fd, int timeout_ms) {
+    // 发送 HTTP GET 请求探测数据通路是否正常
+    const char *req = "GET / HTTP/1.0\r\nHost: cloudflaremirrors.com\r\nConnection: close\r\n\r\n";
+    size_t reqlen = strlen(req);
+    long deadline = now_ms() + timeout_ms;
+    size_t sent = 0;
+    while (sent < reqlen && now_ms() < deadline) {
+        fd_set wfds;
+        FD_ZERO(&wfds);
+        FD_SET(fd, &wfds);
+        int left = (int)(deadline - now_ms());
+        if (left <= 0) break;
+        struct timeval tv = { left / 1000, (left % 1000) * 1000 };
+        int rc = select(fd + 1, NULL, &wfds, NULL, &tv);
+        if (rc <= 0) break;
+        ssize_t n = send(fd, req + sent, reqlen - sent, 0);
+        if (n <= 0) break;
+        sent += (size_t)n;
+    }
+    if (sent < reqlen) return 0;
+    // 读取响应头，确认收到 HTTP 响应
+    char buf[256];
+    size_t used = 0;
+    while (used < sizeof(buf) - 1 && now_ms() < deadline) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(fd, &rfds);
+        int left = (int)(deadline - now_ms());
+        if (left <= 0) break;
+        struct timeval tv = { left / 1000, (left % 1000) * 1000 };
+        int rc = select(fd + 1, &rfds, NULL, NULL, &tv);
+        if (rc <= 0) break;
+        ssize_t n = recv(fd, buf + used, sizeof(buf) - used - 1, 0);
+        if (n <= 0) break;
+        used += (size_t)n;
+        buf[used] = 0;
+        if (strstr(buf, "HTTP/")) return 1;  // 收到 HTTP 响应头表示数据通路正常
+    }
+    return 0;
+}
+
 static int health_check_ip(const char *ip, BaiduProxyPool *proxy_pool) {
     int latency = 0;
-    socket_t fd = dial_target_with_proxy(ip, g_cfg.port, 2000, proxy_pool, &latency);
+    socket_t fd = dial_target_with_proxy(ip, g_cfg.port, g_cfg.delay_ms, proxy_pool, &latency);
     if (cfnat_socket_invalid(fd)) {
-        debug_msg("健康检查失败: IP %s 暂不可用", ip);
+        debug_msg("健康检查失败: IP %s TCP 不可达", ip);
         return 0;
     }
+    // TCP 握手成功后再做 HTTP 探测，确认数据通路正常
+    int ok = http_probe(fd, g_cfg.delay_ms);
     close(fd);
-    debug_msg("健康检查成功: IP %s 延迟 %d ms", ip, latency);
-    return 1;
+    if (ok) {
+        debug_msg("健康检查成功: IP %s 延迟 %d ms", ip, latency);
+        return 1;
+    }
+    debug_msg("健康检查失败: IP %s TCP 可达但 HTTP 无响应", ip);
+    return 0;
 }
 
 static int set_current_candidate(size_t idx) {
@@ -1811,23 +1858,31 @@ static void *connection_thread(void *arg) {
     return NULL;
 }
 
+static int carrier_probe_and_check(socket_t fd, int timeout_ms) {
+    // TCP 握手成功后做 HTTP 探测，确认数据通路正常
+    int ok = http_probe(fd, timeout_ms);
+    close(fd);
+    return ok;
+}
+
 static int carrier_health_check_ip(CarrierRuntime *rt, const char *ip) {
     if (!rt || !ip || !*ip) return 0;
     // 混合模式：先试直连，不行再试百度代理
     if (rt->spec.use_baidu_proxy == 2) {
         int latency = 0;
-        socket_t fd = dial_target_with_proxy(ip, g_cfg.port, 2000, NULL, &latency);
+        socket_t fd = dial_target_with_proxy(ip, g_cfg.port, g_cfg.delay_ms, NULL, &latency);
         if (cfnat_socket_valid(fd)) {
-            close(fd);
-            debug_msg("%s 健康检查成功(直连): IP %s 延迟 %d ms", carrier_display_name(rt->spec.mode), ip, latency);
-            return 1;
-        }
-        if (rt->proxy_pool && rt->proxy_pool->len > 0) {
-            fd = dial_target_with_proxy(ip, g_cfg.port, 2000, rt->proxy_pool, &latency);
-            if (cfnat_socket_valid(fd)) {
-                close(fd);
-                debug_msg("%s 健康检查成功(百度前置): IP %s 延迟 %d ms", carrier_display_name(rt->spec.mode), ip, latency);
+            if (carrier_probe_and_check(fd, g_cfg.delay_ms)) {
+                debug_msg("%s 健康检查成功(直连): IP %s 延迟 %d ms", carrier_display_name(rt->spec.mode), ip, latency);
                 return 1;
+            }
+        } else if (rt->proxy_pool && rt->proxy_pool->len > 0) {
+            fd = dial_target_with_proxy(ip, g_cfg.port, g_cfg.delay_ms, rt->proxy_pool, &latency);
+            if (cfnat_socket_valid(fd)) {
+                if (carrier_probe_and_check(fd, g_cfg.delay_ms)) {
+                    debug_msg("%s 健康检查成功(百度前置): IP %s 延迟 %d ms", carrier_display_name(rt->spec.mode), ip, latency);
+                    return 1;
+                }
             }
         }
         debug_msg("%s 健康检查失败: IP %s 暂不可用", carrier_display_name(rt->spec.mode), ip);
@@ -1835,14 +1890,17 @@ static int carrier_health_check_ip(CarrierRuntime *rt, const char *ip) {
     }
     // 普通模式
     int latency = 0;
-    socket_t fd = dial_target_with_proxy(ip, g_cfg.port, 2000, rt->proxy_pool, &latency);
+    socket_t fd = dial_target_with_proxy(ip, g_cfg.port, g_cfg.delay_ms, rt->proxy_pool, &latency);
     if (cfnat_socket_invalid(fd)) {
         debug_msg("%s 健康检查失败: IP %s 暂不可用", carrier_display_name(rt->spec.mode), ip);
         return 0;
     }
-    close(fd);
-    debug_msg("%s 健康检查成功: IP %s 延迟 %d ms", carrier_display_name(rt->spec.mode), ip, latency);
-    return 1;
+    if (carrier_probe_and_check(fd, g_cfg.delay_ms)) {
+        debug_msg("%s 健康检查成功: IP %s 延迟 %d ms", carrier_display_name(rt->spec.mode), ip, latency);
+        return 1;
+    }
+    debug_msg("%s 健康检查失败: IP %s TCP 可达但 HTTP 无响应", carrier_display_name(rt->spec.mode), ip);
+    return 0;
 }
 
 static int carrier_set_current_candidate(CarrierRuntime *rt, size_t idx) {
