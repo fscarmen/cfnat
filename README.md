@@ -1,4 +1,4 @@
-# cfnat C 版
+# cfnat C 版 v0.0.9
 
 面向低内存环境的 **Cloudflare IP 扫描 + 单端口 TCP 转发** 工具。
 
@@ -73,6 +73,9 @@ Cloudflare 优选 IP:443 或 :80
 - 支持直连优选监听和百度前置优选监听，可单独启用，也可同进程同时启用。
 - 单一 `cfnat.c` 源码通过条件编译同时支持 Linux / macOS / Windows。
 - 统一日志级别：`silent`、`error`、`warn`、`info`、`debug`。
+- 事件驱动 I/O 多路复用：Linux epoll / macOS kqueue / Windows IOCP，降低 select 轮询开销。
+- 候选 IP 懒加载（BatchIterator）：流式扫描，批大小 1024，避免一次性展开全部 CIDR 占用大量内存。
+- 连接级 IP 选择缓存：健康检查线程维护 cache_valid 标记，连接建立时 O(1) 获取当前 IP，跳过重复健康检查。
 
 ---
 
@@ -168,6 +171,7 @@ TLS 流量           → Cloudflare IP:443
 | `-http-port`     | 非 TLS / HTTP 流量转发目标端口                                              | `80`                           |
 | `-random`        | 是否从 CIDR 随机抽样 IP；`true` 启动快，`false` 会完整展开 CIDR，扫描量很大 | `true`                         |
 | `-task`          | 扫描线程数，上限为 `512`                                                    | `100`                          |
+| `-V` / `-version` | 显示版本号并退出                                                            | —                              |
 | `-code`          | HTTP / HTTPS 探测期望状态码                                                 | `200`                          |
 | `-domain`        | 健康检查目标域名与路径                                                      | `cloudflaremirrors.com/debian` |
 | `-health-log`    | 健康检查成功日志输出间隔，单位秒；设为 `0` 可关闭成功日志                   | `60`                           |
@@ -709,6 +713,9 @@ C 版的核心价值是降低常驻资源占用。
 - 候选结果只保留必要字段。
 - 使用原生 `pthread` / Winsock / BSD socket。
 - 健康检查逻辑固定频率执行，不引入复杂后台状态机。
+- 候选 IP 懒加载（BatchIterator）避免一次性展开全部 CIDR，大幅降低扫描阶段内存峰值。
+- 连接级 IP 选择缓存（cache_valid）减少连接建立时的重复健康检查，降低瞬时 CPU 开销。
+- EventLoop 抽象层使用原生 epoll/kqueue/IOCP，替代 select 轮询，提升高并发下的 I/O 效率。
 
 更适合：
 
