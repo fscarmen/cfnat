@@ -1,4 +1,4 @@
-# cfnat C 版 v0.0.9
+# cfnat C 版 v0.0.10
 
 面向低内存环境的 **Cloudflare IP 扫描 + 单端口 TCP 转发** 工具。
 
@@ -65,17 +65,18 @@ Cloudflare 优选 IP:443 或 :80
 - 支持 IPv4 / IPv6 扫描入口。
 - 支持 IPv4 / IPv6 监听地址。
 - 支持按 Cloudflare 数据中心过滤，例如 `HKG`、`SJC`、`LAX`。
-- 候选 IP 按延迟和丢包率综合评分，始终使用当前 score 最低的最优 IP。
+- 候选 IP 按 EWMA 平滑延迟（α=0.125）、丢包率、抖动和连续失败次数综合评分，始终使用当前 score 最低的最优 IP。
 - 默认启用候选缓存，二次启动时先快速健康检查缓存 IP，命中后立即监听，再后台刷新。
 - 单端口同时承接 TLS 与非 TLS / HTTP 流量。
-- 支持定时健康检查与失败自动切换。
+- 渐进式三级健康检查（LIGHT → MEDIUM → FULL），失败自动升级，连续成功降级。
 - 支持百度前置代理。
 - 支持直连优选监听和百度前置优选监听，可单独启用，也可同进程同时启用。
 - 单一 `cfnat.c` 源码通过条件编译同时支持 Linux / macOS / Windows。
 - 统一日志级别：`silent`、`error`、`warn`、`info`、`debug`。
-- 事件驱动 I/O 多路复用：Linux epoll / macOS kqueue / Windows IOCP，降低 select 轮询开销。
-- 候选 IP 懒加载（BatchIterator）：流式扫描，批大小 1024，避免一次性展开全部 CIDR 占用大量内存。
-- 连接级 IP 选择缓存：健康检查线程维护 cache_valid 标记，连接建立时 O(1) 获取当前 IP，跳过重复健康检查。
+- 事件驱动 I/O 多路复用：Linux epoll / macOS kqueue / select 回退，降低 select 轮询开销。
+- CIDR 惰性展开（前缀和 + 二分查找）：只存 CIDR 范围，按需生成 IP，KB 级内存即可处理百万级 IP 段。
+- HTTP Keep-Alive 连接复用：同一 IP 多次探测复用 TCP 连接，断连后自动重连，减少握手开销。
+- 连接级 IP 选择缓存 + 代理节点选择缓存（5 秒），连接建立和节点切换时 O(1) 获取，降低 CPU 开销。
 
 ---
 
@@ -170,7 +171,7 @@ TLS 流量           → Cloudflare IP:443
 | `-port`          | TLS 流量转发目标端口                                                        | `443`                          |
 | `-http-port`     | 非 TLS / HTTP 流量转发目标端口                                              | `80`                           |
 | `-random`        | 是否从 CIDR 随机抽样 IP；`true` 启动快，`false` 会完整展开 CIDR，扫描量很大 | `true`                         |
-| `-task`          | 扫描线程数，上限为 `512`                                                    | `100`                          |
+| `-task`          | 扫描线程数                                                                  | `100`                          |
 | `-V` / `-version` | 显示版本号并退出                                                            | —                              |
 | `-code`          | HTTP / HTTPS 探测期望状态码                                                 | `200`                          |
 | `-domain`        | 健康检查目标域名与路径                                                      | `cloudflaremirrors.com/debian` |
@@ -341,15 +342,24 @@ xxxx-LAX
 
 ### 6. 综合评分
 
-候选 IP 会根据延迟和丢包率计算综合分，分数越低越优。
+候选 IP 会根据 EWMA 平滑延迟、丢包率、抖动和连续失败次数计算综合分，分数越低越优。
 
-可以近似理解为：
+评分公式：
 
 ```text
-score = latency * 10 + loss_rate * 25
+base_latency = ewma_latency > 0 ? ewma_latency : latency_ms
+score = base_latency * 10 + loss_rate * 25 + jitter_ms * 5
+if consecutive_fail > 0:
+    penalty = 50
+    for i in 0..min(consecutive_fail, 10): penalty *= 2
+    score += penalty
 ```
 
-所以程序不是单纯选择最低延迟，而是同时考虑速度和稳定性。
+- **EWMA 平滑延迟**：`ewma = ewma × 7/8 + best_latency × 1/8`（α=0.125），消除单次延迟毛刺。
+- **抖动（jitter）**：`jitter = (jitter × 7 + |best_latency - ewma|) / 8`，同样用 EWMA 平滑，衡量延迟波动幅度，抖动大的 IP 即使平均延迟低也会被扣分。
+- **连续失败指数惩罚**：连续失败 1 次 +50，2 次 +100，3 次 +200……指数级增长，快速淘汰不稳定节点。
+
+所以程序不是单纯选择最低延迟，而是综合评估平滑延迟、稳定性、丢包率和历史可靠性。
 
 ### 优选原则
 
@@ -368,15 +378,26 @@ score = latency * 10 + loss_rate * 25
 
 ### 7. 健康检查
 
-程序会对候选 IP 做目标端口健康检查。
+程序会对候选 IP 做目标端口健康检查。采用三级渐进策略，根据节点历史表现动态调整检查强度：
 
-只有健康检查通过的 IP 才会成为当前转发 IP。
+```text
+LIGHT（轻量级）  → TCP 端口连通性探测，仅检查端口是否可达
+MEDIUM（中等）   → TCP 连通 + HTTP 请求，验证 HTTP 状态码
+FULL（全量）     → TCP 连通 + HTTP 请求 + 完整响应体读取，验证内容完整性
+```
+
+- 新节点首次检查从 `MEDIUM` 开始。
+- 连续成功 3 次后降级为 `LIGHT`，降低检查开销。
+- 任意一次失败立即升级为 `FULL`，确认节点是否彻底不可用。
+- 只有健康检查通过的 IP 才会成为当前转发 IP。
 
 ### 8. 自动切换
 
 运行期间会定时检查当前 IP。
 
 当当前 IP 连续失败两次后，程序会切换到下一个可用候选；如果候选池耗尽，会重新扫描。
+
+切换时优先使用代理节点选择缓存（5 秒有效期），避免高频重复选择。
 
 ### 9. 单端口自动分流
 
@@ -713,9 +734,12 @@ C 版的核心价值是降低常驻资源占用。
 - 候选结果只保留必要字段。
 - 使用原生 `pthread` / Winsock / BSD socket。
 - 健康检查逻辑固定频率执行，不引入复杂后台状态机。
-- 候选 IP 懒加载（BatchIterator）避免一次性展开全部 CIDR，大幅降低扫描阶段内存峰值。
+- CIDR 惰性展开（前缀和 + 二分查找）：只存 CIDR 范围，按需生成 IP，KB 级内存即可处理百万级 IP 段。
 - 连接级 IP 选择缓存（cache_valid）减少连接建立时的重复健康检查，降低瞬时 CPU 开销。
-- EventLoop 抽象层使用原生 epoll/kqueue/IOCP，替代 select 轮询，提升高并发下的 I/O 效率。
+- EventLoop 抽象层使用原生 epoll/kqueue，select 回退，提升高并发下的 I/O 效率。
+- EWMA 评分算法：平滑延迟波动，避免单次毛刺导致链路切换，提升稳定性。
+- 代理节点选择缓存（5 秒）：高频选择场景下 O(1) 命中，降低 CPU 开销。
+- 渐进式三级健康检查：LIGHT 级别仅做 TCP 探测，减少健康检查对转发性能的影响。
 
 更适合：
 
