@@ -1,4 +1,4 @@
-#define CFNAT_VERSION "0.0.10"
+#define CFNAT_VERSION "0.0.11"
 
 #ifdef _WIN32
 #ifndef _WIN32_WINNT
@@ -1287,26 +1287,44 @@ static socket_t tcp_connect_ev(const char *ip, int port, int timeout_ms, int *la
 
 /* 基于 EventLoop 的 HTTP 响应头接收，带 O(n²) 防护 */
 static int recv_headers_ev(socket_t fd, char *buf, size_t bufsz, int timeout_ms, EventLoop *el) {
+#if defined(__linux__) || defined(__APPLE__)
+    if (!el || el->epoll_fd < 0) {
+        return recv_headers(fd, buf, bufsz, timeout_ms);
+    }
+    if (evloop_add(el, fd, EV_READ) != 0) {
+        return recv_headers(fd, buf, bufsz, timeout_ms);
+    }
+#else
+    return recv_headers(fd, buf, bufsz, timeout_ms);
+#endif
     size_t used = 0;
     size_t search_pos = 0;  /* 避免 O(n²) 退化 */
     long deadline = now_ms() + timeout_ms;
+    int result = 0;
     while (used + 1 < bufsz && now_ms() < deadline) {
         struct evloop_event ev;
         int left = (int)(deadline - now_ms());
         if (left <= 0) break;
         int n = evloop_wait(el, &ev, 1, left);
         if (n <= 0) break;
+        if (ev.fd != fd || !(ev.events & EV_READ)) continue;
         ssize_t nread = recv(fd, buf + used, bufsz - used - 1, 0);
         if (nread <= 0) break;
         used += (size_t)nread;
         buf[used] = 0;
         /* 只从 search_pos 开始搜索，避免 O(n²) */
         char *found = strstr(buf + search_pos, "\r\n\r\n");
-        if (found) return (int)(found - buf + 4);  /* 包含 \r\n\r\n */
+        if (found) {
+            result = (int)(found - buf + 4);  /* 包含 \r\n\r\n */
+            break;
+        }
         search_pos = used > 3 ? used - 3 : 0;  /* 保留末尾 3 字节防止跨边界 */
     }
     buf[used] = 0;
-    return (int)used;
+#if defined(__linux__) || defined(__APPLE__)
+    evloop_del(el, fd);
+#endif
+    return result > 0 ? result : (int)used;
 }
 
 /* ── EventLoop 版 I/O 函数结束 ─────────────────────────────── */
@@ -1662,7 +1680,7 @@ static void *scan_worker(void *arg) {
                 jitter_ms = (jitter_ms * 7 + diff) / 8;
                 ewma_latency = (ewma_latency * 7 + best_latency) / 8;
             }
-            if (best_latency == 0 || latency < best_latency) {
+            if (!best_colo[0] || best_latency == 0 || latency <= best_latency) {
                 snprintf(best_colo, sizeof(best_colo), "%s", colo);
             }
         }
@@ -2897,7 +2915,12 @@ int main(int argc, char **argv) {
             }
 
             if (carrier_results.len == 0) {
-                warn_msg("%s 未扫描到可用候选 IP", carrier_display_name(rt->spec.mode));
+                warn_msg("%s 未扫描到可用候选 IP，3 秒后重试", carrier_display_name(rt->spec.mode));
+                strlist_free(&ips);
+                if (sleep_interruptible_ms(3000) != 0) break;
+                ips = load_ip_list(ipfile, g_cfg.random_mode);
+                if (ips.len == 0) { sleep_interruptible_ms(3000); i--; continue; }
+                i--;
                 continue;
             }
             rt->candidates.items = carrier_results.items;
@@ -2905,10 +2928,15 @@ int main(int argc, char **argv) {
             // 扫描完成后保存缓存，供下次启动加速
             save_candidate_cache(candidate_cache_file(rt->spec.mode), carrier_results.items, carrier_results.len);
             if (!carrier_select_valid_ip(rt)) {
-                warn_msg("%s 候选 IP 健康检查全部失败", carrier_display_name(rt->spec.mode));
+                warn_msg("%s 候选 IP 健康检查全部失败，3 秒后重试", carrier_display_name(rt->spec.mode));
                 free(rt->candidates.items);
                 rt->candidates.items = NULL;
                 rt->candidates.len = 0;
+                strlist_free(&ips);
+                if (sleep_interruptible_ms(3000) != 0) break;
+                ips = load_ip_list(ipfile, g_cfg.random_mode);
+                if (ips.len == 0) { sleep_interruptible_ms(3000); i--; continue; }
+                i--;
                 continue;
             }
             rt->listen_fd = listen_tcp(rt->spec.addr);
@@ -2990,7 +3018,7 @@ int main(int argc, char **argv) {
     }
     strlist_free(&ips);
     free(carrier_specs);
-    if (!cache_hit) {
+    if (results.len > 0) {
         printf("候选池统计\n");
         printf("候选总数: %zu\n", results.len);
         printf("IP 地址 | 数据中心 | 地区 | 城市 | 延迟 | 丢包 | 探测成功\n");
